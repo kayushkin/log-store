@@ -1,0 +1,13 @@
+[Unit]
+Description=log-store — durable event log for llm-bridge
+After=network.target
+
+[Service]
+ExecStart=/home/kayushkincom/bin/log-store
+Restart=on-failure
+RestartSec=3
+Environment=LOG_STORE_LISTEN_ADDR=:8175
+Environment=LOG_STORE_LOGSTACK_URL=http://localhost:8081
+
+[Install]
+WantedBy=default.target
