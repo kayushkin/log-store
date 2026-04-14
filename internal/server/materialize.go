@@ -7,28 +7,11 @@ import (
 	"github.com/kayushkin/llm-bridge/msg"
 )
 
-// MaterializedMessage is an assembled message for the /messages endpoint.
-// Meta is the full ResultEvent — no fields stripped.
-// Events contains every raw event that contributed to this message.
-type MaterializedMessage struct {
-	Role      string            `json:"role"`
-	Content   string            `json:"content"`
-	Thinking  string            `json:"thinking,omitempty"`
-	Tools     []MaterializedTool `json:"tools,omitempty"`
-	Meta      *msg.ResultEvent  `json:"meta,omitempty"`
-	Events    []json.RawMessage `json:"events,omitempty"`
-	Timestamp string            `json:"timestamp"`
-	Done      bool              `json:"done"`
-}
-
-// MaterializedTool preserves tool call data without narrowing.
-type MaterializedTool struct {
-	ToolID string          `json:"tool_id"`
-	Tool   string          `json:"tool"`
-	Input  json.RawMessage `json:"input,omitempty"`
-	Output string          `json:"output,omitempty"`
-	Error  bool            `json:"error,omitempty"`
-}
+// Canonical types from msg package.
+type (
+	MaterializedMessage = msg.MaterializedMessage
+	MaterializedTool    = msg.MaterializedTool
+)
 
 func materializeMessages(rawEvents []json.RawMessage) []MaterializedMessage {
 	var msgs []MaterializedMessage
