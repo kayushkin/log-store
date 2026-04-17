@@ -107,6 +107,42 @@ func (s *Store) ListEventsSinceID(sessionID string, afterID int) ([]json.RawMess
 	return events, rows.Err()
 }
 
+// SearchSessions returns session IDs with events whose raw data contains query.
+// Match count is the number of matching events per session.
+func (s *Store) SearchSessions(query string, limit int) ([]SearchHit, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := s.db.Query(
+		`SELECT session_id, COUNT(*) AS n
+		 FROM events
+		 WHERE data LIKE '%' || ? || '%'
+		 GROUP BY session_id
+		 ORDER BY MAX(id) DESC
+		 LIMIT ?`,
+		query, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var hits []SearchHit
+	for rows.Next() {
+		var h SearchHit
+		if err := rows.Scan(&h.SessionID, &h.MatchCount); err != nil {
+			return nil, err
+		}
+		hits = append(hits, h)
+	}
+	return hits, rows.Err()
+}
+
+// SearchHit is a single session match from SearchSessions.
+type SearchHit struct {
+	SessionID  string `json:"session_id"`
+	MatchCount int    `json:"match_count"`
+}
+
 // SessionIDs returns all distinct session IDs that have events.
 func (s *Store) SessionIDs() ([]string, error) {
 	rows, err := s.db.Query(`SELECT DISTINCT session_id FROM events ORDER BY session_id`)

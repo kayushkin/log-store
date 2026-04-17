@@ -21,6 +21,7 @@ type Server struct {
 func New(s *store.Store, forwarder *ls.Forwarder) *Server {
 	srv := &Server{store: s, forwarder: forwarder, mux: http.NewServeMux()}
 	srv.mux.HandleFunc("POST /api/v1/events", srv.handleIngestEvent)
+	srv.mux.HandleFunc("GET /api/v1/sessions/search", srv.handleSearch)
 	srv.mux.HandleFunc("GET /api/v1/sessions/{id}/messages", srv.handleMessages)
 	srv.mux.HandleFunc("GET /api/v1/sessions/{id}/history", srv.handleHistory)
 	srv.mux.HandleFunc("GET /api/v1/sessions/{id}/events", srv.handleEvents)
@@ -121,6 +122,30 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		events = []json.RawMessage{}
 	}
 	writeJSON(w, events)
+}
+
+// handleSearch returns session IDs whose events contain the query substring.
+func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query().Get("q")
+	if q == "" {
+		writeJSON(w, []store.SearchHit{})
+		return
+	}
+	limit := 100
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if n, err := strconv.Atoi(l); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	hits, err := s.store.SearchSessions(q, limit)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if hits == nil {
+		hits = []store.SearchHit{}
+	}
+	writeJSON(w, hits)
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
