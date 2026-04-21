@@ -66,9 +66,11 @@ func (s *Store) StoreEvent(sessionID, eventType string, data []byte) (int64, err
 }
 
 // ListEvents returns all stored events for a session, ordered chronologically.
+// Each event's JSON is decorated with an "event_id" field carrying the row ID,
+// so clients can track the high-water mark and dedup against SSE replay.
 func (s *Store) ListEvents(sessionID string) ([]json.RawMessage, error) {
 	rows, err := s.db.Query(
-		`SELECT data FROM events WHERE session_id=? ORDER BY id ASC`,
+		`SELECT id, data FROM events WHERE session_id=? ORDER BY id ASC`,
 		sessionID,
 	)
 	if err != nil {
@@ -77,19 +79,21 @@ func (s *Store) ListEvents(sessionID string) ([]json.RawMessage, error) {
 	defer rows.Close()
 	var events []json.RawMessage
 	for rows.Next() {
+		var rowID int64
 		var data string
-		if err := rows.Scan(&data); err != nil {
+		if err := rows.Scan(&rowID, &data); err != nil {
 			return nil, err
 		}
-		events = append(events, json.RawMessage(data))
+		events = append(events, injectEventID([]byte(data), rowID))
 	}
 	return events, rows.Err()
 }
 
-// ListEventsSinceID returns events after a specific row ID.
+// ListEventsSinceID returns events after a specific row ID. See ListEvents for
+// the event_id decoration.
 func (s *Store) ListEventsSinceID(sessionID string, afterID int) ([]json.RawMessage, error) {
 	rows, err := s.db.Query(
-		`SELECT data FROM events WHERE session_id=? AND id > ? ORDER BY id ASC`,
+		`SELECT id, data FROM events WHERE session_id=? AND id > ? ORDER BY id ASC`,
 		sessionID, afterID,
 	)
 	if err != nil {
@@ -98,13 +102,35 @@ func (s *Store) ListEventsSinceID(sessionID string, afterID int) ([]json.RawMess
 	defer rows.Close()
 	var events []json.RawMessage
 	for rows.Next() {
+		var rowID int64
 		var data string
-		if err := rows.Scan(&data); err != nil {
+		if err := rows.Scan(&rowID, &data); err != nil {
 			return nil, err
 		}
-		events = append(events, json.RawMessage(data))
+		events = append(events, injectEventID([]byte(data), rowID))
 	}
 	return events, rows.Err()
+}
+
+// injectEventID splices an "event_id":<rowID> field into an event's top-level
+// JSON object. Returns the original bytes unchanged if data isn't a JSON object.
+func injectEventID(data []byte, rowID int64) json.RawMessage {
+	trimmed := data
+	for len(trimmed) > 0 && (trimmed[0] == ' ' || trimmed[0] == '\t' || trimmed[0] == '\n' || trimmed[0] == '\r') {
+		trimmed = trimmed[1:]
+	}
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return data
+	}
+	prefix := fmt.Sprintf(`{"event_id":%d,`, rowID)
+	// Handle empty object "{}" — drop the trailing comma.
+	if len(trimmed) >= 2 && trimmed[1] == '}' {
+		prefix = fmt.Sprintf(`{"event_id":%d`, rowID)
+	}
+	out := make([]byte, 0, len(prefix)+len(trimmed)-1)
+	out = append(out, prefix...)
+	out = append(out, trimmed[1:]...)
+	return out
 }
 
 // SearchSessions returns session IDs with events whose raw data contains query.

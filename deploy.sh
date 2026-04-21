@@ -21,6 +21,11 @@ fi
 # Add go to PATH if managed by mise
 export PATH="$HOME/.local/share/mise/shims:$PATH"
 
+# systemctl --user needs these when run from a shell without its own DBus
+# session (e.g. automation, Claude shells). No-op when already set.
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR}/bus}"
+
 echo "==> Building $BINARY..."
 go build -o "$BINARY" ./cmd/log-store
 echo "    built: $(ls -lh "$BINARY" | awk '{print $5}')"
