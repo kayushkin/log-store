@@ -28,6 +28,12 @@ func New(dbPath string) (*Store, error) {
 		return nil, fmt.Errorf("sqlite pragmas: %w", err)
 	}
 
+	// Single connection serializes writes through Go's sql pool. Without this,
+	// modernc.org/sqlite still hits SQLITE_BUSY (5) under concurrent writers,
+	// silently dropping events (e.g. user_message via PushEvent) when the
+	// caller swallows the 500.
+	d.SetMaxOpenConns(1)
+
 	s := &Store{db: d}
 	if err := s.migrate(); err != nil {
 		d.Close()
