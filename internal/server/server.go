@@ -48,17 +48,11 @@ func (s *Server) handleIngestEvent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if ev.SessionID == "" && ev.BridgeID == "" {
-		http.Error(w, `{"error":"missing session_id"}`, http.StatusBadRequest)
+	if ev.BridgeSessionID == "" {
+		http.Error(w, `{"error":"missing bridge_session_id"}`, http.StatusBadRequest)
 		return
 	}
-
-	// Use bridge_id as the canonical storage key when present, so all events
-	// for a session land under the same ID regardless of harness-native IDs.
-	storeID := ev.BridgeID
-	if storeID == "" {
-		storeID = ev.SessionID
-	}
+	storeID := ev.BridgeSessionID
 
 	// Store the raw body verbatim — no re-serialization
 	rowID, err := s.store.StoreEvent(storeID, string(ev.Type), body)

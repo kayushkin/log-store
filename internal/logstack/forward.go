@@ -72,12 +72,13 @@ func buildLogEntry(ev msg.Event) models.LogEntry {
 		ts = time.Now()
 	}
 
+	sid := ev.BridgeSessionID
 	return models.LogEntry{
-		ID:           ev.SessionID + "-" + ts.Format("20060102T150405"),
+		ID:           sid + "-" + ts.Format("20060102T150405"),
 		Timestamp:    ts,
 		Orchestrator: "llm-bridge",
 		Agent:        string(ev.Harness),
-		SessionID:    ev.SessionID,
+		SessionID:    sid,
 		Level:        models.LevelInfo,
 		Type:         "outbound",
 		Content:      map[string]interface{}{"text": r.Text},
