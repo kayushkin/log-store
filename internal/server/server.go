@@ -22,6 +22,7 @@ func New(s *store.Store, forwarder *ls.Forwarder) *Server {
 	srv := &Server{store: s, forwarder: forwarder, mux: http.NewServeMux()}
 	srv.mux.HandleFunc("POST /api/v1/events", srv.handleIngestEvent)
 	srv.mux.HandleFunc("GET /api/v1/sessions/search", srv.handleSearch)
+	srv.mux.HandleFunc("GET /api/v1/sessions/aggregates", srv.handleAggregates)
 	srv.mux.HandleFunc("GET /api/v1/sessions/{id}/messages", srv.handleMessages)
 	srv.mux.HandleFunc("GET /api/v1/sessions/{id}/history", srv.handleHistory)
 	srv.mux.HandleFunc("GET /api/v1/sessions/{id}/events", srv.handleEvents)
@@ -140,6 +141,29 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		hits = []store.SearchHit{}
 	}
 	writeJSON(w, hits)
+}
+
+// handleAggregates returns per-session token/cost totals summed from the
+// stored result events.
+func (s *Server) handleAggregates(w http.ResponseWriter, r *http.Request) {
+	rows, err := s.store.ListSessionAggregates()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	out := make([]msg.SessionAggregate, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, msg.SessionAggregate{
+			SessionID:    r.SessionID,
+			Turns:        r.Turns,
+			InputTokens:  r.InputTokens,
+			OutputTokens: r.OutputTokens,
+			CostUSD:      r.CostUSD,
+			DurationMS:   r.DurationMS,
+			Model:        r.Model,
+		})
+	}
+	writeJSON(w, out)
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {

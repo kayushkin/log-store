@@ -175,6 +175,65 @@ type SearchHit struct {
 	MatchCount int    `json:"match_count"`
 }
 
+// SessionAggregateRow is one session's summed totals as returned by
+// ListSessionAggregates. JSON marshalling lives on msg.SessionAggregate;
+// the handler converts row → response struct.
+type SessionAggregateRow struct {
+	SessionID    string
+	Turns        int
+	InputTokens  int64
+	OutputTokens int64
+	CostUSD      float64
+	DurationMS   int64
+	Model        string
+}
+
+// ListSessionAggregates returns per-session token/cost totals computed
+// directly from the stored result events. SUMs over JSON-extracted fields;
+// Model is the last result event's model per session.
+//
+// Sessions with no result events are omitted (no usage to report).
+func (s *Store) ListSessionAggregates() ([]SessionAggregateRow, error) {
+	rows, err := s.db.Query(`
+		SELECT
+			session_id,
+			COUNT(*) AS turns,
+			COALESCE(SUM(json_extract(data, '$.result.usage.input_tokens')), 0)  AS input_tokens,
+			COALESCE(SUM(json_extract(data, '$.result.usage.output_tokens')), 0) AS output_tokens,
+			COALESCE(SUM(json_extract(data, '$.result.cost.total_usd')), 0)      AS cost_usd,
+			COALESCE(SUM(json_extract(data, '$.result.duration_ms')), 0)         AS duration_ms,
+			(
+				SELECT json_extract(e2.data, '$.result.model')
+				FROM events e2
+				WHERE e2.session_id = e1.session_id
+				  AND e2.type = 'result'
+				  AND json_extract(e2.data, '$.result.model') IS NOT NULL
+				ORDER BY e2.id DESC
+				LIMIT 1
+			) AS model
+		FROM events e1
+		WHERE type = 'result'
+		GROUP BY session_id
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []SessionAggregateRow
+	for rows.Next() {
+		var r SessionAggregateRow
+		var model sql.NullString
+		if err := rows.Scan(&r.SessionID, &r.Turns, &r.InputTokens, &r.OutputTokens, &r.CostUSD, &r.DurationMS, &model); err != nil {
+			return nil, err
+		}
+		if model.Valid {
+			r.Model = model.String
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // SessionIDs returns all distinct session IDs that have events.
 func (s *Store) SessionIDs() ([]string, error) {
 	rows, err := s.db.Query(`SELECT DISTINCT session_id FROM events ORDER BY session_id`)
