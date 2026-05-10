@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 
@@ -45,7 +46,7 @@ func New(dbPath string) (*Store, error) {
 func (s *Store) Close() error { return s.db.Close() }
 
 func (s *Store) migrate() error {
-	_, err := s.db.Exec(`
+	if _, err := s.db.Exec(`
 		CREATE TABLE IF NOT EXISTS events (
 			id         INTEGER PRIMARY KEY AUTOINCREMENT,
 			session_id TEXT NOT NULL,
@@ -55,11 +56,72 @@ func (s *Store) migrate() error {
 		);
 		CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);
 		CREATE INDEX IF NOT EXISTS idx_events_session_type ON events(session_id, type);
-	`)
-	return err
+	`); err != nil {
+		return err
+	}
+	// sessions projection — per-session rollup of token / cost / turn / model
+	// totals derived from the events table. Maintained synchronously by
+	// StoreEvent so reads are O(1) instead of O(events). Always rebuildable
+	// from events; backfilled below if rows are missing.
+	if _, err := s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS sessions (
+			session_id    TEXT PRIMARY KEY,
+			turn_count    INTEGER NOT NULL DEFAULT 0,
+			input_tokens  INTEGER NOT NULL DEFAULT 0,
+			output_tokens INTEGER NOT NULL DEFAULT 0,
+			cost_usd      REAL    NOT NULL DEFAULT 0,
+			duration_ms   INTEGER NOT NULL DEFAULT 0,
+			model         TEXT    NOT NULL DEFAULT '',
+			started_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			last_active   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			ended_at      DATETIME
+		);
+		CREATE INDEX IF NOT EXISTS idx_sessions_last_active ON sessions(last_active);
+	`); err != nil {
+		return err
+	}
+	// Backfill from events for any session not already projected. Runs once
+	// per session — guarded by NOT IN to skip already-populated sessions.
+	if _, err := s.db.Exec(`
+		INSERT INTO sessions (
+			session_id, turn_count, input_tokens, output_tokens,
+			cost_usd, duration_ms, model, started_at, last_active, ended_at
+		)
+		SELECT
+			e.session_id,
+			COALESCE(SUM(CASE WHEN e.type = 'user_message' THEN 1 ELSE 0 END), 0)               AS turn_count,
+			COALESCE(SUM(CASE WHEN e.type = 'result' THEN json_extract(e.data, '$.result.usage.input_tokens') ELSE 0 END), 0)  AS input_tokens,
+			COALESCE(SUM(CASE WHEN e.type = 'result' THEN json_extract(e.data, '$.result.usage.output_tokens') ELSE 0 END), 0) AS output_tokens,
+			COALESCE(SUM(CASE WHEN e.type = 'result' THEN json_extract(e.data, '$.result.cost.total_usd') ELSE 0 END), 0)      AS cost_usd,
+			COALESCE(SUM(CASE WHEN e.type = 'result' THEN json_extract(e.data, '$.result.duration_ms') ELSE 0 END), 0)         AS duration_ms,
+			COALESCE((
+				SELECT json_extract(e2.data, '$.result.model')
+				FROM events e2
+				WHERE e2.session_id = e.session_id
+				  AND e2.type = 'result'
+				  AND json_extract(e2.data, '$.result.model') IS NOT NULL
+				ORDER BY e2.id DESC LIMIT 1
+			), '') AS model,
+			MIN(e.created_at)                                                                   AS started_at,
+			MAX(e.created_at)                                                                   AS last_active,
+			(
+				SELECT MAX(e3.created_at) FROM events e3
+				WHERE e3.session_id = e.session_id AND e3.type IN ('result','error')
+			)                                                                                   AS ended_at
+		FROM events e
+		WHERE e.session_id NOT IN (SELECT session_id FROM sessions)
+		GROUP BY e.session_id
+	`); err != nil {
+		return fmt.Errorf("backfill sessions projection: %w", err)
+	}
+	return nil
 }
 
-// StoreEvent persists a raw event and returns its row ID.
+// StoreEvent persists a raw event and updates the per-session projection.
+// The projection is a derived cache; failure to update is logged but does
+// not fail the underlying event insert (the event is still queryable; the
+// next StoreEvent call rolls forward correctly, and on next boot migrate()
+// will not re-backfill an already-present row).
 func (s *Store) StoreEvent(sessionID, eventType string, data []byte) (int64, error) {
 	result, err := s.db.Exec(
 		`INSERT INTO events (session_id, type, data) VALUES (?,?,?)`,
@@ -68,7 +130,94 @@ func (s *Store) StoreEvent(sessionID, eventType string, data []byte) (int64, err
 	if err != nil {
 		return 0, err
 	}
-	return result.LastInsertId()
+	id, _ := result.LastInsertId()
+	if err := s.updateSessionProjection(sessionID, eventType, data); err != nil {
+		log.Printf("[log-store] update sessions projection for %s/%s: %v", sessionID, eventType, err)
+	}
+	return id, nil
+}
+
+// updateSessionProjection rolls forward the per-session sessions row for one
+// new event. Idempotent on re-application of the same event because
+// last_active uses CURRENT_TIMESTAMP and turn_count / token sums are
+// monotonic only when StoreEvent is called once per event (the caller's job).
+func (s *Store) updateSessionProjection(sessionID, eventType string, data []byte) error {
+	// Ensure the row exists. INSERT OR IGNORE is a no-op for established
+	// sessions; for the first event of a new session it seeds started_at /
+	// last_active to NOW().
+	if _, err := s.db.Exec(
+		`INSERT OR IGNORE INTO sessions (session_id) VALUES (?)`,
+		sessionID,
+	); err != nil {
+		return fmt.Errorf("seed sessions row: %w", err)
+	}
+	// Bump last_active on every event regardless of type.
+	if _, err := s.db.Exec(
+		`UPDATE sessions SET last_active = CURRENT_TIMESTAMP WHERE session_id = ?`,
+		sessionID,
+	); err != nil {
+		return fmt.Errorf("touch last_active: %w", err)
+	}
+	switch eventType {
+	case "user_message":
+		_, err := s.db.Exec(
+			`UPDATE sessions SET turn_count = turn_count + 1 WHERE session_id = ?`,
+			sessionID,
+		)
+		return err
+	case "result":
+		// Parse usage / cost / model / duration from the result event.
+		// Failures here are silent: the projection just doesn't get the
+		// numbers from this event. Better to log and continue than to
+		// block event ingestion on a malformed result.
+		var ev struct {
+			Result struct {
+				Usage struct {
+					InputTokens  int64 `json:"input_tokens"`
+					OutputTokens int64 `json:"output_tokens"`
+				} `json:"usage"`
+				Cost struct {
+					TotalUSD float64 `json:"total_usd"`
+				} `json:"cost"`
+				DurationMS int64  `json:"duration_ms"`
+				Model      string `json:"model"`
+			} `json:"result"`
+		}
+		if err := json.Unmarshal(data, &ev); err != nil {
+			log.Printf("[log-store] decode result event %s: %v", sessionID, err)
+			// Still set ended_at — the event terminated the turn even if
+			// the body was malformed.
+			_, err := s.db.Exec(
+				`UPDATE sessions SET ended_at = CURRENT_TIMESTAMP WHERE session_id = ?`,
+				sessionID,
+			)
+			return err
+		}
+		_, err := s.db.Exec(
+			`UPDATE sessions SET
+				input_tokens = input_tokens + ?,
+				output_tokens = output_tokens + ?,
+				cost_usd = cost_usd + ?,
+				duration_ms = duration_ms + ?,
+				model = CASE WHEN ? != '' THEN ? ELSE model END,
+				ended_at = CURRENT_TIMESTAMP
+			WHERE session_id = ?`,
+			ev.Result.Usage.InputTokens,
+			ev.Result.Usage.OutputTokens,
+			ev.Result.Cost.TotalUSD,
+			ev.Result.DurationMS,
+			ev.Result.Model, ev.Result.Model,
+			sessionID,
+		)
+		return err
+	case "error":
+		_, err := s.db.Exec(
+			`UPDATE sessions SET ended_at = CURRENT_TIMESTAMP WHERE session_id = ?`,
+			sessionID,
+		)
+		return err
+	}
+	return nil
 }
 
 // ListEvents returns all stored events for a session, ordered chronologically.
@@ -188,32 +337,20 @@ type SessionAggregateRow struct {
 	Model        string
 }
 
-// ListSessionAggregates returns per-session token/cost totals computed
-// directly from the stored result events. SUMs over JSON-extracted fields;
-// Model is the last result event's model per session.
+// ListSessionAggregates returns per-session token/cost totals from the
+// sessions projection table maintained by StoreEvent. Sessions with no
+// result events are omitted (no usage to report) — matches the previous
+// on-demand-aggregation behavior.
 //
-// Sessions with no result events are omitted (no usage to report).
+// Turns counts user_message events (one per user turn). The previous
+// implementation accidentally counted result events as "turns"; the
+// projection's turn_count field is the corrected definition.
 func (s *Store) ListSessionAggregates() ([]SessionAggregateRow, error) {
 	rows, err := s.db.Query(`
-		SELECT
-			session_id,
-			COUNT(*) AS turns,
-			COALESCE(SUM(json_extract(data, '$.result.usage.input_tokens')), 0)  AS input_tokens,
-			COALESCE(SUM(json_extract(data, '$.result.usage.output_tokens')), 0) AS output_tokens,
-			COALESCE(SUM(json_extract(data, '$.result.cost.total_usd')), 0)      AS cost_usd,
-			COALESCE(SUM(json_extract(data, '$.result.duration_ms')), 0)         AS duration_ms,
-			(
-				SELECT json_extract(e2.data, '$.result.model')
-				FROM events e2
-				WHERE e2.session_id = e1.session_id
-				  AND e2.type = 'result'
-				  AND json_extract(e2.data, '$.result.model') IS NOT NULL
-				ORDER BY e2.id DESC
-				LIMIT 1
-			) AS model
-		FROM events e1
-		WHERE type = 'result'
-		GROUP BY session_id
+		SELECT session_id, turn_count, input_tokens, output_tokens,
+		       cost_usd, duration_ms, model
+		FROM sessions
+		WHERE input_tokens > 0 OR output_tokens > 0 OR cost_usd > 0
 	`)
 	if err != nil {
 		return nil, err
@@ -222,12 +359,8 @@ func (s *Store) ListSessionAggregates() ([]SessionAggregateRow, error) {
 	var out []SessionAggregateRow
 	for rows.Next() {
 		var r SessionAggregateRow
-		var model sql.NullString
-		if err := rows.Scan(&r.SessionID, &r.Turns, &r.InputTokens, &r.OutputTokens, &r.CostUSD, &r.DurationMS, &model); err != nil {
+		if err := rows.Scan(&r.SessionID, &r.Turns, &r.InputTokens, &r.OutputTokens, &r.CostUSD, &r.DurationMS, &r.Model); err != nil {
 			return nil, err
-		}
-		if model.Valid {
-			r.Model = model.String
 		}
 		out = append(out, r)
 	}
