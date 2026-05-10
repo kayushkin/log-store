@@ -223,11 +223,18 @@ func (s *Store) updateSessionProjection(sessionID, eventType string, data []byte
 // ListEvents returns all stored events for a session, ordered chronologically.
 // Each event's JSON is decorated with an "event_id" field carrying the row ID,
 // so clients can track the high-water mark and dedup against SSE replay.
-func (s *Store) ListEvents(sessionID string) ([]json.RawMessage, error) {
-	rows, err := s.db.Query(
-		`SELECT id, data FROM events WHERE session_id=? ORDER BY id ASC`,
-		sessionID,
-	)
+// If types is non-empty, only events whose `type` is in the set are returned.
+func (s *Store) ListEvents(sessionID string, types []string) ([]json.RawMessage, error) {
+	q := `SELECT id, data FROM events WHERE session_id=?`
+	args := []any{sessionID}
+	if len(types) > 0 {
+		q += ` AND type IN (` + placeholders(len(types)) + `)`
+		for _, t := range types {
+			args = append(args, t)
+		}
+	}
+	q += ` ORDER BY id ASC`
+	rows, err := s.db.Query(q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -246,11 +253,17 @@ func (s *Store) ListEvents(sessionID string) ([]json.RawMessage, error) {
 
 // ListEventsSinceID returns events after a specific row ID. See ListEvents for
 // the event_id decoration.
-func (s *Store) ListEventsSinceID(sessionID string, afterID int) ([]json.RawMessage, error) {
-	rows, err := s.db.Query(
-		`SELECT id, data FROM events WHERE session_id=? AND id > ? ORDER BY id ASC`,
-		sessionID, afterID,
-	)
+func (s *Store) ListEventsSinceID(sessionID string, afterID int, types []string) ([]json.RawMessage, error) {
+	q := `SELECT id, data FROM events WHERE session_id=? AND id > ?`
+	args := []any{sessionID, afterID}
+	if len(types) > 0 {
+		q += ` AND type IN (` + placeholders(len(types)) + `)`
+		for _, t := range types {
+			args = append(args, t)
+		}
+	}
+	q += ` ORDER BY id ASC`
+	rows, err := s.db.Query(q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -265,6 +278,20 @@ func (s *Store) ListEventsSinceID(sessionID string, afterID int) ([]json.RawMess
 		events = append(events, injectEventID([]byte(data), rowID))
 	}
 	return events, rows.Err()
+}
+
+func placeholders(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	out := make([]byte, 0, n*2-1)
+	for i := 0; i < n; i++ {
+		if i > 0 {
+			out = append(out, ',')
+		}
+		out = append(out, '?')
+	}
+	return string(out)
 }
 
 // injectEventID splices an "event_id":<rowID> field into an event's top-level
@@ -365,6 +392,41 @@ func (s *Store) ListSessionAggregates() ([]SessionAggregateRow, error) {
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// TurnState reports per-session in-flight turn information by inspecting the
+// events table for the latest user_message and the latest terminator
+// (result/error).
+//
+// A turn is in-flight when a user_message exists with no later terminator.
+// LastUserMessageEventID and LastTerminatorEventID are 0 when no such event
+// exists; bridge-server callers compare them to decide whether to recover.
+type TurnState struct {
+	LastUserMessageEventID int64 `json:"last_user_message_event_id"`
+	LastTerminatorEventID  int64 `json:"last_terminator_event_id"`
+	InFlight               bool  `json:"in_flight"`
+}
+
+// TurnState returns the latest user_message and terminator row IDs for a
+// session along with the derived in-flight flag.
+func (s *Store) TurnState(sessionID string) (TurnState, error) {
+	var ts TurnState
+	row := s.db.QueryRow(
+		`SELECT COALESCE(MAX(id), 0) FROM events WHERE session_id=? AND type='user_message'`,
+		sessionID,
+	)
+	if err := row.Scan(&ts.LastUserMessageEventID); err != nil {
+		return ts, err
+	}
+	row = s.db.QueryRow(
+		`SELECT COALESCE(MAX(id), 0) FROM events WHERE session_id=? AND type IN ('result','error')`,
+		sessionID,
+	)
+	if err := row.Scan(&ts.LastTerminatorEventID); err != nil {
+		return ts, err
+	}
+	ts.InFlight = ts.LastUserMessageEventID > ts.LastTerminatorEventID && ts.LastUserMessageEventID > 0
+	return ts, nil
 }
 
 // SessionIDs returns all distinct session IDs that have events.

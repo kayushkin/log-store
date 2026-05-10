@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 
 	ls "github.com/kayushkin/log-store/internal/logstack"
 	"github.com/kayushkin/log-store/internal/store"
@@ -26,6 +27,7 @@ func New(s *store.Store, forwarder *ls.Forwarder) *Server {
 	srv.mux.HandleFunc("GET /api/v1/sessions/{id}/messages", srv.handleMessages)
 	srv.mux.HandleFunc("GET /api/v1/sessions/{id}/history", srv.handleHistory)
 	srv.mux.HandleFunc("GET /api/v1/sessions/{id}/events", srv.handleEvents)
+	srv.mux.HandleFunc("GET /api/v1/sessions/{id}/turn-state", srv.handleTurnState)
 	srv.mux.HandleFunc("GET /health", srv.handleHealth)
 	return srv
 }
@@ -73,10 +75,11 @@ func (s *Server) handleIngestEvent(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]int64{"id": rowID})
 }
 
-// handleMessages returns materialized messages for a session.
+// handleMessages returns materialized messages for a session. Materialization
+// always reads the full event stream — no types filter applied.
 func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	rawEvents, err := s.store.ListEvents(id)
+	rawEvents, err := s.store.ListEvents(id, nil)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -85,10 +88,11 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, msgs)
 }
 
-// handleHistory returns raw stored events for a session.
+// handleHistory returns raw stored events for a session, optionally filtered
+// by ?types=foo,bar.
 func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	events, err := s.store.ListEvents(id)
+	events, err := s.store.ListEvents(id, parseTypes(r))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -99,7 +103,8 @@ func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, events)
 }
 
-// handleEvents returns events after a given row ID (for polling/reconnection).
+// handleEvents returns events after a given row ID (for polling/reconnection),
+// optionally filtered by ?types=foo,bar.
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	afterStr := r.URL.Query().Get("after")
@@ -108,7 +113,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		afterID, _ = strconv.Atoi(afterStr)
 	}
 
-	events, err := s.store.ListEventsSinceID(id, afterID)
+	events, err := s.store.ListEventsSinceID(id, afterID, parseTypes(r))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -117,6 +122,40 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		events = []json.RawMessage{}
 	}
 	writeJSON(w, events)
+}
+
+// handleTurnState returns the in-flight turn state for a session, derived from
+// the latest user_message and result/error events.
+func (s *Server) handleTurnState(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	ts, err := s.store.TurnState(id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, ts)
+}
+
+// parseTypes splits the ?types= query into a non-empty slice of event types,
+// or returns nil if the parameter is absent / empty (callers treat nil as
+// "no filter").
+func parseTypes(r *http.Request) []string {
+	raw := r.URL.Query().Get("types")
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := parts[:0]
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // handleSearch returns session IDs whose events contain the query substring.
