@@ -38,7 +38,7 @@ echo "==> Installing binary to $BIN_DIR..."
 cp "$BINARY" "$BIN_DIR/$BINARY"
 
 echo "==> Installing service file..."
-cp "$REPO_DIR/$SERVICE" "$HOME/.config/systemd/user/$SERVICE"
+sed "s|__HOME__|$HOME|g" "$REPO_DIR/$SERVICE" > "$HOME/.config/systemd/user/$SERVICE"
 systemctl --user daemon-reload
 
 echo "==> Starting $SERVICE..."

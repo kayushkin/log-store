@@ -3,7 +3,7 @@ Description=log-store — durable event log for llm-bridge
 After=network.target
 
 [Service]
-ExecStart=/home/kayushkincom/bin/log-store
+ExecStart=__HOME__/bin/log-store
 Restart=on-failure
 RestartSec=3
 Environment=LOG_STORE_LISTEN_ADDR=:8175
