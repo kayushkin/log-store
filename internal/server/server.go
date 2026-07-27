@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	ls "github.com/kayushkin/log-store/internal/logstack"
 	"github.com/kayushkin/log-store/internal/store"
@@ -26,6 +27,9 @@ func New(s *store.Store, forwarder *ls.Forwarder) *Server {
 	srv.mux.HandleFunc("GET /api/v1/sessions/aggregates", srv.handleAggregates)
 	srv.mux.HandleFunc("GET /api/v1/sessions/{id}/messages", srv.handleMessages)
 	srv.mux.HandleFunc("GET /api/v1/sessions/{id}/history", srv.handleHistory)
+	// dashv2 additive endpoints — turn-model materialization + validators.
+	srv.mux.HandleFunc("GET /api/v1/sessions/validators", srv.handleValidators)
+	srv.mux.HandleFunc("GET /api/v1/sessions/bundle", srv.handleBundle)
 	srv.mux.HandleFunc("GET /api/v1/sessions/{id}/events", srv.handleEvents)
 	srv.mux.HandleFunc("GET /api/v1/sessions/{id}/turn-state", srv.handleTurnState)
 	srv.mux.HandleFunc("GET /health", srv.handleHealth)
@@ -75,17 +79,142 @@ func (s *Server) handleIngestEvent(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]int64{"id": rowID})
 }
 
-// handleMessages returns materialized messages for a session. Materialization
-// always reads the full event stream — no types filter applied.
+// handleMessages returns materialized messages for a session.
+//
+// Two shapes, selected additively by query params so existing callers are
+// unaffected:
+//   - No `limit`/`before`: the legacy shape — a []MaterializedMessage array
+//     over the FULL event stream. Byte-for-byte the prior behavior; existing
+//     consumers (bridge-ui BridgeSessions) still work.
+//   - `limit` and/or `before` present: the dashv2 shape — a bounded, annotated
+//     TurnModel ({ model }). Default returns the last `limit` turns; `before`
+//     pages older. NEVER unbounded (see store.maxEventsPerPage) — the legacy
+//     full-stream materialize is what produced 306MB/85s for one session.
 func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	rawEvents, err := s.store.ListEvents(id, nil)
+	q := r.URL.Query()
+	limitStr := q.Get("limit")
+	beforeStr := q.Get("before")
+
+	if limitStr == "" && beforeStr == "" {
+		// Legacy path — unchanged.
+		rawEvents, err := s.store.ListEvents(id, nil)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		msgs := materializeMessages(rawEvents)
+		writeJSON(w, msgs)
+		return
+	}
+
+	limit := 30
+	if limitStr != "" {
+		if n, err := strconv.Atoi(limitStr); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	var before int64
+	if beforeStr != "" {
+		if n, err := strconv.ParseInt(beforeStr, 10, 64); err == nil && n > 0 {
+			before = n
+		}
+	}
+	model, err := s.materializeTail(id, limit, before)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	msgs := materializeMessages(rawEvents)
-	writeJSON(w, msgs)
+	writeJSON(w, MessagesResponse{Model: model})
+}
+
+// materializeTail assembles the bounded, annotated TurnModel for a session's
+// tail (or a page older than `before`). This is the settled-history dedup owner
+// (D4/D9): it groups events into turns and annotates duplicate/primary/source,
+// but emits every event in the window.
+func (s *Server) materializeTail(id string, limit int, before int64) (TurnModel, error) {
+	rows, more, err := s.store.EventPage(id, limit, before)
+	if err != nil {
+		return TurnModel{}, err
+	}
+	model := buildTurnModel(id, rows, more)
+	// Overlay the whole-session validator so the client can staleness-check the
+	// tail against a cheap /validators sweep (page-local counts are not
+	// comparable to the session-wide validator).
+	if vs, verr := s.store.Validators([]string{id}); verr == nil {
+		if v, ok := vs[id]; ok {
+			model.Validator = toWireValidator(v)
+		}
+	}
+	return model, nil
+}
+
+// handleValidators returns the per-session validator for a comma-separated set
+// of ids: GET /api/v1/sessions/validators?ids=a,b,c → { [id]: Validator }.
+func (s *Server) handleValidators(w http.ResponseWriter, r *http.Request) {
+	ids := splitIDs(r.URL.Query().Get("ids"))
+	if len(ids) == 0 {
+		writeJSON(w, map[string]Validator{})
+		return
+	}
+	vs, err := s.store.Validators(ids)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	out := make(map[string]Validator, len(vs))
+	for id, v := range vs {
+		out[id] = toWireValidator(v)
+	}
+	writeJSON(w, out)
+}
+
+// handleBundle returns a materialized tail TurnModel for each requested session
+// in one response: GET /api/v1/sessions/bundle?ids=a,b,c&turns=30 →
+// { [id]: TurnModel }. llm-bridge-server assembles the summary+model recent
+// bundle on top of this.
+func (s *Server) handleBundle(w http.ResponseWriter, r *http.Request) {
+	ids := splitIDs(r.URL.Query().Get("ids"))
+	turns := 30
+	if t := r.URL.Query().Get("turns"); t != "" {
+		if n, err := strconv.Atoi(t); err == nil && n > 0 {
+			turns = n
+		}
+	}
+	out := make(map[string]TurnModel, len(ids))
+	for _, id := range ids {
+		model, err := s.materializeTail(id, turns, 0)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		out[id] = model
+	}
+	writeJSON(w, out)
+}
+
+// toWireValidator maps a store validator to the wire shape (RFC3339+offset).
+func toWireValidator(v store.SessionValidator) Validator {
+	updated := ""
+	if !v.UpdatedAt.IsZero() {
+		updated = v.UpdatedAt.Format(time.RFC3339)
+	}
+	return Validator{MaxEventID: v.MaxEventID, EventCount: v.EventCount, UpdatedAt: updated}
+}
+
+// splitIDs parses a comma-separated id list, trimming blanks.
+func splitIDs(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // handleHistory returns raw stored events for a session, optionally filtered
