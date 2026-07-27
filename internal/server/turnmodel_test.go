@@ -174,6 +174,130 @@ func TestBuildTurnModel_IdenticalResend_ShowsTwice(t *testing.T) {
 	}
 }
 
+// recoveredBlock builds a recovered/OTel assistant text block exactly as
+// llm-bridge-claudecode handler.go flushRecoveredAssistant emits it: an EventBlock text
+// tagged extensions.source="otel", recovered=true, and (like the real emit) NO turn id.
+func recoveredBlock(t *testing.T, id int64, ts time.Time, text string) store.EventRow {
+	return mkRow(t, id, msg.Event{
+		Type:      msg.EventBlock,
+		Timestamp: ts,
+		Block: &msg.BlockEvent{
+			Index: 0,
+			Block: &msg.ContentBlock{Type: msg.BlockText, Text: &msg.TextBlock{Text: text}},
+		},
+		Extensions: map[string]json.RawMessage{
+			"source":    json.RawMessage(`"otel"`),
+			"recovered": json.RawMessage(`true`),
+		},
+	})
+}
+
+// A1: a turn consisting only of a recovered OTel block must materialize to ONE
+// visible (Primary) assistant entry — hiding it would lose the model's only message.
+func TestBuildTurnModel_RecoveredOTelBlock_VisiblePrimary(t *testing.T) {
+	base := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
+	rows := []store.EventRow{recoveredBlock(t, 1, base, "final answer")}
+	m := buildTurnModel("s", rows, false)
+
+	visible := 0
+	var got Entry
+	for _, e := range m.Entries {
+		if e.Role == "assistant" && e.Kind == "text" && !e.Duplicate {
+			visible++
+			got = e
+		}
+	}
+	if visible != 1 {
+		t.Fatalf("expected exactly 1 visible assistant entry, got %d", visible)
+	}
+	if !got.Primary || got.Duplicate {
+		t.Errorf("recovered block must be primary/visible, got %+v", got)
+	}
+	if !got.Recovered {
+		t.Errorf("recovered flag must be preserved, got %+v", got)
+	}
+	if got.Text != "final answer" {
+		t.Errorf("text = %q", got.Text)
+	}
+	if got.Source != sourceOTel {
+		t.Errorf("source = %q, want otel", got.Source)
+	}
+}
+
+// A1 no-regression: when a Result supersedes it in the same turn, a recovered block
+// stays hidden (duplicate) — exactly like a streamed block in a healthy turn.
+func TestBuildTurnModel_RecoveredBlock_HiddenWhenResultSupersedes(t *testing.T) {
+	base := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
+	rows := []store.EventRow{
+		mkRow(t, 1, msg.Event{Type: msg.EventUserMessage, TurnID: "turn1", Timestamp: base, Result: &msg.ResultEvent{Text: "q"}}),
+		mkRow(t, 2, msg.Event{Type: msg.EventResult, TurnID: "turn1", Timestamp: base.Add(time.Second), Result: &msg.ResultEvent{Text: "streamed answer"}}),
+		// recovered block has no turn id → attaches to the open turn1
+		recoveredBlock(t, 3, base.Add(2*time.Second), "duplicate-ish"),
+	}
+	m := buildTurnModel("s", rows, false)
+	block := m.Entries["e_3"]
+	if !block.Duplicate || block.Primary {
+		t.Errorf("superseded recovered block should stay hidden, got %+v", block)
+	}
+	if !block.Recovered {
+		t.Errorf("recovered flag must be preserved even when hidden, got %+v", block)
+	}
+}
+
+// B2: error entries carry the canonical ErrorEvent fields (code/retryable/statusCode).
+func TestBuildTurnModel_ErrorFields(t *testing.T) {
+	base := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
+	rows := []store.EventRow{
+		mkRow(t, 1, msg.Event{Type: msg.EventError, TurnID: "t", Timestamp: base, Extensions: otelExt(),
+			Error: &msg.ErrorEvent{Code: "api_error", Message: "Overloaded", Retryable: true, StatusCode: 529}}),
+		mkRow(t, 2, msg.Event{Type: msg.EventError, TurnID: "t", Timestamp: base.Add(time.Second),
+			Error: &msg.ErrorEvent{Code: "TURN_IDLE_TIMEOUT", Message: "no output for 5m"}}),
+	}
+	m := buildTurnModel("s", rows, false)
+	api := m.Entries["e_1"]
+	if api.Kind != "error" || api.Code != "api_error" || !api.Retryable || api.StatusCode != 529 {
+		t.Errorf("api_error entry fields wrong: %+v", api)
+	}
+	if api.Text != "Overloaded" {
+		t.Errorf("error text = %q", api.Text)
+	}
+	term := m.Entries["e_2"]
+	if term.Code != "TURN_IDLE_TIMEOUT" || term.Retryable || term.StatusCode != 0 {
+		t.Errorf("TURN_IDLE_TIMEOUT entry fields wrong: %+v", term)
+	}
+}
+
+// C: a subagent_completed system event is surfaced on the settled path (visible, kind
+// "system", carrying subtype), consistent with the live tail — never an error.
+func TestBuildTurnModel_SubagentCompleted_Visible(t *testing.T) {
+	base := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
+	rows := []store.EventRow{
+		mkRow(t, 1, msg.Event{Type: msg.EventSystem, TurnID: "t", Timestamp: base, Extensions: otelExt(),
+			System: &msg.SystemEvent{Subtype: "subagent_completed", Message: "code-reviewer"}}),
+		// an unknown/bookkeeping subtype stays hidden (meta)
+		mkRow(t, 2, msg.Event{Type: msg.EventSystem, TurnID: "t", Timestamp: base.Add(time.Second),
+			System: &msg.SystemEvent{Subtype: "mcp_server_connection"}}),
+	}
+	m := buildTurnModel("s", rows, false)
+	sub := m.Entries["e_1"]
+	if sub.Kind != "system" || sub.Duplicate || !sub.Primary {
+		t.Errorf("subagent_completed should be visible kind system, got %+v", sub)
+	}
+	if sub.Subtype != "subagent_completed" {
+		t.Errorf("subtype = %q, want subagent_completed", sub.Subtype)
+	}
+	if sub.Role == "assistant" && sub.Kind == "error" {
+		t.Errorf("subagent progress must never be an error: %+v", sub)
+	}
+	if sub.Text != "code-reviewer" {
+		t.Errorf("system message text = %q", sub.Text)
+	}
+	meta := m.Entries["e_2"]
+	if !meta.Duplicate {
+		t.Errorf("unknown system subtype should stay hidden (meta), got %+v", meta)
+	}
+}
+
 // Turns group by bridge TurnID; entryIds preserve eventId order.
 func TestBuildTurnModel_TurnGrouping(t *testing.T) {
 	base := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)

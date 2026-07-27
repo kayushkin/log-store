@@ -35,6 +35,15 @@ type Entry struct {
 	ToolResult json.RawMessage `json:"toolResult,omitempty"`
 	Raw        json.RawMessage `json:"raw,omitempty"`
 
+	// Provenance / kind-specific fields, mapped 1:1 from the canonical event
+	// (extensions / msg.ErrorEvent / msg.SystemEvent) — never invented. Mirror
+	// chat-core src/net/types.ts Entry.
+	Recovered  bool   `json:"recovered,omitempty"`  // OTel assistant text recovered after a dropped stream
+	Code       string `json:"code,omitempty"`       // ErrorEvent.Code (TURN_IDLE_TIMEOUT, api_error, …)
+	Retryable  bool   `json:"retryable,omitempty"`  // ErrorEvent.Retryable
+	StatusCode int    `json:"statusCode,omitempty"` // ErrorEvent.StatusCode
+	Subtype    string `json:"subtype,omitempty"`    // SystemEvent.Subtype (subagent_completed, …)
+
 	Duplicate bool   `json:"duplicate"`
 	Primary   bool   `json:"primary"`
 	GroupID   string `json:"groupId,omitempty"`
@@ -89,6 +98,33 @@ func eventSource(ev *msg.Event) string {
 	return sourceHarness
 }
 
+// isVisibleSystemSubtype reports whether a system event's subtype is a
+// conversation-visible progress marker (shown in the collapsed view), as opposed
+// to bookkeeping. Kept consistent with the live tail: the settled path surfaces the
+// same known progress subtypes the tail does. subagent_completed is progress, never
+// an error.
+func isVisibleSystemSubtype(subtype string) bool {
+	switch subtype {
+	case "compact_boundary", "subagent_completed":
+		return true
+	default:
+		return false
+	}
+}
+
+// isRecovered reports whether an event carries extensions.recovered=true — the OTel
+// assistant text llm-bridge-claudecode surfaces when the live stream produced nothing
+// that turn (handler.go flushRecoveredAssistant).
+func isRecovered(ev *msg.Event) bool {
+	if raw, ok := ev.Extensions["recovered"]; ok {
+		var b bool
+		if json.Unmarshal(raw, &b) == nil && b {
+			return true
+		}
+	}
+	return false
+}
+
 // classify maps an event to its wire (role, kind) and whether it is a
 // "conversation" atom that belongs in the collapsed Turns view. Bookkeeping and
 // superseded-partial events (stream deltas, blocks, session_state, api_call,
@@ -109,9 +145,11 @@ func classify(ev *msg.Event) (role, kind string, conversation bool) {
 	case msg.EventError:
 		return "assistant", "error", true
 	case msg.EventSystem:
-		// A compact boundary is a real conversation marker; other system
-		// events are bookkeeping.
-		if ev.System != nil && ev.System.Subtype == "compact_boundary" {
+		// A compact boundary and known progress subtypes (e.g. subagent_completed)
+		// are real conversation markers, surfaced on the settled path exactly as the
+		// live tail shows them — visible, kind "system", carrying the subtype. Other
+		// system events are bookkeeping. A known progress subtype is never an error.
+		if ev.System != nil && isVisibleSystemSubtype(ev.System.Subtype) {
 			return "system", "system", true
 		}
 		return "system", "meta", false
@@ -185,7 +223,7 @@ func buildTurnModel(sessionID string, rows []store.EventRow, more bool) TurnMode
 			Raw:     append(json.RawMessage(nil), r.Data...),
 		}
 		switch ev.Type {
-		case msg.EventUserMessage, msg.EventResult, msg.EventThinking, msg.EventStream, msg.EventBlock, msg.EventError:
+		case msg.EventUserMessage, msg.EventResult, msg.EventThinking, msg.EventStream, msg.EventBlock, msg.EventError, msg.EventSystem:
 			e.Text = messageText(&ev)
 		case msg.EventToolCall:
 			if ev.ToolCall != nil {
@@ -197,6 +235,18 @@ func buildTurnModel(sessionID string, rows []store.EventRow, more bool) TurnMode
 				e.ToolName = ev.ToolResult.Name
 				e.ToolResult = json.RawMessage(quoteJSON(ev.ToolResult.Output))
 			}
+		}
+		// Kind-specific fields, mapped straight from the canonical event.
+		if ev.Type == msg.EventError && ev.Error != nil {
+			e.Code = ev.Error.Code
+			e.Retryable = ev.Error.Retryable
+			e.StatusCode = ev.Error.StatusCode
+		}
+		if ev.Type == msg.EventSystem && ev.System != nil {
+			e.Subtype = ev.System.Subtype
+		}
+		if isRecovered(&ev) {
+			e.Recovered = true
 		}
 
 		// Default annotation. Conversation atoms are shown (primary, not
@@ -266,6 +316,17 @@ func buildTurnModel(sessionID string, rows []store.EventRow, more bool) TurnMode
 
 	turns := buildTurns(order, entries)
 
+	// Surface recovered/OTel assistant text (A1). A recovered EventBlock text —
+	// the OTel copy llm-bridge-claudecode forwards when the live stream produced
+	// nothing that turn — is classified as a superseded streaming block (hidden) by
+	// default. But in a dropped turn there is no Result or harness assistant text to
+	// supersede it, so hiding it would lose the model's only final message. Promote
+	// such a block to the visible/primary conversation atom when nothing in its turn
+	// supersedes it. Normal turns carry no recovered/OTel block (the healthy OTel copy
+	// is buffered and dropped upstream), so their streamed blocks stay hidden — no
+	// regression. The recovered flag is preserved either way.
+	surfaceRecoveredBlocks(turns, entries)
+
 	// Validator is derived from the events actually present. maxEventID is the
 	// high-water row id in this page; the count endpoint (/validators) reports
 	// the whole-session totals used for staleness — here we report the page's
@@ -332,6 +393,63 @@ func buildTurns(order []string, entries map[string]Entry) []Turn {
 	return turns
 }
 
+// isRecoveredOrOTelAssistantText reports whether an entry is a recovered/OTel-sourced
+// assistant text atom — the candidate A1 must keep visible when unsuperseded. Stream
+// deltas are harness-sourced so they never match; only the forwarded OTel block does.
+func isRecoveredOrOTelAssistantText(e Entry) bool {
+	return e.Role == "assistant" && e.Kind == "text" && e.Text != "" &&
+		(e.Recovered || e.Source == sourceOTel)
+}
+
+// supersedesRecovered reports whether an entry is an authoritative assistant message
+// that would supersede a recovered/OTel block in the same turn: a Result, or a normal
+// (harness, non-recovered) assistant text. When present, the recovered block stays
+// hidden exactly like a streamed block in a healthy turn.
+func supersedesRecovered(e Entry) bool {
+	if e.Text == "" {
+		return false
+	}
+	if e.Kind == "result" && e.Role == "assistant" {
+		return true
+	}
+	if e.Kind == "text" && e.Role == "assistant" && e.Source == sourceHarness && !e.Recovered {
+		return true
+	}
+	return false
+}
+
+// surfaceRecoveredBlocks promotes recovered/OTel assistant text blocks to visible
+// primary atoms in any turn where nothing supersedes them (A1). Mutates `entries` in
+// place; non-destructive (only flips duplicate/primary annotation, drops nothing).
+func surfaceRecoveredBlocks(turns []Turn, entries map[string]Entry) {
+	for _, turn := range turns {
+		superseded := false
+		hasCandidate := false
+		for _, eid := range turn.EntryIDs {
+			e := entries[eid]
+			if isRecoveredOrOTelAssistantText(e) {
+				hasCandidate = true
+				continue
+			}
+			if supersedesRecovered(e) {
+				superseded = true
+			}
+		}
+		if !hasCandidate || superseded {
+			continue
+		}
+		for _, eid := range turn.EntryIDs {
+			e := entries[eid]
+			if !isRecoveredOrOTelAssistantText(e) {
+				continue
+			}
+			e.Primary = true
+			e.Duplicate = false
+			entries[eid] = e
+		}
+	}
+}
+
 // messageText returns the display text for a text-bearing event.
 func messageText(ev *msg.Event) string {
 	switch ev.Type {
@@ -346,6 +464,10 @@ func messageText(ev *msg.Event) string {
 	case msg.EventError:
 		if ev.Error != nil {
 			return ev.Error.Message
+		}
+	case msg.EventSystem:
+		if ev.System != nil {
+			return ev.System.Message
 		}
 	case msg.EventStream:
 		if ev.Stream != nil && ev.Stream.Delta != nil {
