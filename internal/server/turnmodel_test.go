@@ -325,6 +325,169 @@ func TestBuildTurnModel_TurnGrouping(t *testing.T) {
 	}
 }
 
+// Phase 2: an assistant result carrying usage meta populates Entry.usage,
+// mapped from msg.TokenUsage (cacheWriteTokens ← CacheWriteTokens).
+func TestBuildTurnModel_EntryUsage_Populated(t *testing.T) {
+	base := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
+	rows := []store.EventRow{
+		mkRow(t, 1, msg.Event{Type: msg.EventUserMessage, TurnID: "t", Timestamp: base, Result: &msg.ResultEvent{Text: "q"}}),
+		mkRow(t, 2, msg.Event{Type: msg.EventResult, TurnID: "t", Timestamp: base.Add(time.Second), Result: &msg.ResultEvent{
+			Text:  "a",
+			Usage: msg.TokenUsage{InputTokens: 100, OutputTokens: 40, CacheReadTokens: 12, CacheWriteTokens: 7},
+		}}),
+	}
+	m := buildTurnModel("s", rows, false)
+
+	// The user prompt has no usage meta → omitted (nil).
+	if u := m.Entries["e_1"].Usage; u != nil {
+		t.Errorf("user prompt entry should have no usage, got %+v", u)
+	}
+	got := m.Entries["e_2"].Usage
+	if got == nil {
+		t.Fatalf("result entry should carry usage")
+	}
+	if got.InputTokens != 100 || got.OutputTokens != 40 || got.CacheReadTokens != 12 || got.CacheWriteTokens != 7 {
+		t.Errorf("usage mapped wrong: %+v", got)
+	}
+
+	// It must serialize under the camelCase `usage` key.
+	blob, err := json.Marshal(m.Entries["e_2"])
+	if err != nil {
+		t.Fatalf("marshal entry: %v", err)
+	}
+	var probe struct {
+		Usage *EntryUsage `json:"usage"`
+	}
+	if err := json.Unmarshal(blob, &probe); err != nil {
+		t.Fatalf("unmarshal entry: %v", err)
+	}
+	if probe.Usage == nil || probe.Usage.CacheWriteTokens != 7 {
+		t.Errorf("usage did not round-trip under camelCase key: %s", blob)
+	}
+}
+
+// Phase 2: an all-zero result usage is omitted (nil), not emitted as {}.
+func TestBuildTurnModel_EntryUsage_OmittedWhenZero(t *testing.T) {
+	base := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
+	rows := []store.EventRow{
+		mkRow(t, 1, msg.Event{Type: msg.EventResult, TurnID: "t", Timestamp: base, Result: &msg.ResultEvent{Text: "a"}}),
+	}
+	m := buildTurnModel("s", rows, false)
+	if u := m.Entries["e_1"].Usage; u != nil {
+		t.Errorf("zero-usage result should omit usage, got %+v", u)
+	}
+	blob, _ := json.Marshal(m.Entries["e_1"])
+	var raw map[string]json.RawMessage
+	_ = json.Unmarshal(blob, &raw)
+	if _, present := raw["usage"]; present {
+		t.Errorf("usage key must be absent for zero usage: %s", blob)
+	}
+}
+
+// Phase 2: an api_spend_total event + a context-bearing usage_total event
+// populate TurnModel.aggregates (totalUsd/byModel/byQuerySource + context state).
+func TestBuildTurnModel_Aggregates_Populated(t *testing.T) {
+	base := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
+	rows := []store.EventRow{
+		mkRow(t, 1, msg.Event{Type: msg.EventUserMessage, TurnID: "t", Timestamp: base, Result: &msg.ResultEvent{Text: "q"}}),
+		mkRow(t, 2, msg.Event{Type: msg.EventResult, TurnID: "t", Timestamp: base.Add(time.Second), Result: &msg.ResultEvent{Text: "a"}}),
+		// latest spend total in the window
+		mkRow(t, 3, msg.Event{Type: msg.EventAPISpendTotal, TurnID: "t", Timestamp: base.Add(2 * time.Second), APISpendTotal: &msg.APISpendTotalEvent{
+			TotalUSD:      0.0704,
+			Calls:         3,
+			ByModel:       map[string]float64{"opus": 0.07, "haiku": 0.0004},
+			ByQuerySource: map[string]float64{"main": 0.07, "generate_session_title": 0.0004},
+		}}),
+		// latest context-bearing usage state
+		mkRow(t, 4, msg.Event{Type: msg.EventUsageTotal, TurnID: "t", Timestamp: base.Add(3 * time.Second), UsageTotal: &msg.UsageTotalEvent{
+			Usage: msg.TokenUsage{ContextTokens: 34000, ContextLimit: 200000},
+			Turns: 1,
+		}}),
+	}
+	m := buildTurnModel("s", rows, false)
+	agg := m.Aggregates
+	if agg == nil {
+		t.Fatalf("aggregates should be populated")
+	}
+	if agg.TotalUSD != 0.0704 {
+		t.Errorf("totalUsd = %v, want 0.0704", agg.TotalUSD)
+	}
+	if agg.ByModel["opus"] != 0.07 || agg.ByModel["haiku"] != 0.0004 {
+		t.Errorf("byModel wrong: %+v", agg.ByModel)
+	}
+	if agg.ByQuerySource["main"] != 0.07 || agg.ByQuerySource["generate_session_title"] != 0.0004 {
+		t.Errorf("byQuerySource wrong: %+v", agg.ByQuerySource)
+	}
+	if agg.ContextTokens != 34000 || agg.ContextLimit != 200000 {
+		t.Errorf("context state wrong: tokens=%d limit=%d", agg.ContextTokens, agg.ContextLimit)
+	}
+
+	// aggregates must serialize under the camelCase key with camelCase fields.
+	blob, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal model: %v", err)
+	}
+	var probe struct {
+		Aggregates *TurnAggregates `json:"aggregates"`
+	}
+	if err := json.Unmarshal(blob, &probe); err != nil {
+		t.Fatalf("unmarshal model: %v", err)
+	}
+	if probe.Aggregates == nil || probe.Aggregates.TotalUSD != 0.0704 || probe.Aggregates.ContextLimit != 200000 {
+		t.Errorf("aggregates did not round-trip under camelCase: %s", blob)
+	}
+}
+
+// Phase 2: totalUsd falls back to the sum of byModel when TotalUSD is zero but a
+// per-model breakdown exists.
+func TestBuildTurnModel_Aggregates_TotalUSDFallsBackToByModel(t *testing.T) {
+	base := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
+	rows := []store.EventRow{
+		mkRow(t, 1, msg.Event{Type: msg.EventAPISpendTotal, TurnID: "t", Timestamp: base, APISpendTotal: &msg.APISpendTotalEvent{
+			ByModel: map[string]float64{"opus": 0.05, "haiku": 0.001},
+		}}),
+	}
+	m := buildTurnModel("s", rows, false)
+	if m.Aggregates == nil {
+		t.Fatalf("aggregates should be populated")
+	}
+	if got := m.Aggregates.TotalUSD; got < 0.0509 || got > 0.0511 {
+		t.Errorf("totalUsd fallback = %v, want ~0.051", got)
+	}
+}
+
+// Phase 2 no-regression: a session with no spend/usage/context events yields no
+// aggregates and no per-entry usage — the field is omitted and the legacy array
+// path is byte-identical to before.
+func TestBuildTurnModel_Aggregates_OmittedWhenAbsent(t *testing.T) {
+	base := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
+	rows := []store.EventRow{
+		mkRow(t, 1, msg.Event{Type: msg.EventUserMessage, TurnID: "t", Timestamp: base, Result: &msg.ResultEvent{Text: "q"}}),
+		mkRow(t, 2, msg.Event{Type: msg.EventResult, TurnID: "t", Timestamp: base.Add(time.Second), Result: &msg.ResultEvent{Text: "a"}}),
+	}
+	m := buildTurnModel("s", rows, false)
+	if m.Aggregates != nil {
+		t.Errorf("aggregates must be nil when no spend/context events present, got %+v", m.Aggregates)
+	}
+	// The model must serialize WITHOUT the aggregates key (legacy byte-identity).
+	blob, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal model: %v", err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(blob, &raw); err != nil {
+		t.Fatalf("unmarshal model: %v", err)
+	}
+	if _, present := raw["aggregates"]; present {
+		t.Errorf("aggregates key must be absent in a no-cost session: %s", blob)
+	}
+	for _, e := range m.Entries {
+		if e.Usage != nil {
+			t.Errorf("no entry should carry usage in a no-usage session, got %+v", e.Usage)
+		}
+	}
+}
+
 // Timestamps must serialize as RFC3339 with offset, never naive.
 func TestBuildTurnModel_RFC3339Timestamps(t *testing.T) {
 	base := time.Date(2026, 7, 27, 14, 3, 11, 0, time.FixedZone("PDT", -7*3600))
