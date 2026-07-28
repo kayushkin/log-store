@@ -35,6 +35,12 @@ type Entry struct {
 	ToolResult json.RawMessage `json:"toolResult,omitempty"`
 	Raw        json.RawMessage `json:"raw,omitempty"`
 
+	// Usage is the per-message token usage for assistant/result entries,
+	// mapped 1:1 from the terminating ResultEvent.Usage (msg.TokenUsage). Nil
+	// (omitted) for entries with no usage meta — user prompts, tool calls,
+	// legacy/no-cost turns. Additive: legacy consumers ignore it.
+	Usage *EntryUsage `json:"usage,omitempty"`
+
 	// Provenance / kind-specific fields, mapped 1:1 from the canonical event
 	// (extensions / msg.ErrorEvent / msg.SystemEvent) — never invented. Mirror
 	// chat-core src/net/types.ts Entry.
@@ -47,6 +53,44 @@ type Entry struct {
 	Duplicate bool   `json:"duplicate"`
 	Primary   bool   `json:"primary"`
 	GroupID   string `json:"groupId,omitempty"`
+}
+
+// EntryUsage is the per-message token usage carried on an assistant/result
+// Entry. Fields mirror msg.TokenUsage (llm-bridge/msg/usage.go) exactly, mapped
+// to the chat-core camelCase wire names. Every field is omitempty so an
+// all-zero usage still serializes to `{}` only when explicitly attached (the
+// pointer itself is omitted when there is no usage meta at all).
+//
+// NOTE ON NAMES: cacheCreationTokens is sourced from msg.TokenUsage.CacheWriteTokens
+// (json `cache_write_tokens`) — the canonical struct calls cache-creation
+// "write". There is NO CacheCreationTokens field on TokenUsage; the
+// per-api-call APICallEvent uses that name, but the message-level TokenUsage
+// does not. We map the concept, not a same-named field.
+type EntryUsage struct {
+	InputTokens         int `json:"inputTokens,omitempty"`
+	OutputTokens        int `json:"outputTokens,omitempty"`
+	CacheReadTokens     int `json:"cacheReadTokens,omitempty"`
+	CacheCreationTokens int `json:"cacheCreationTokens,omitempty"`
+}
+
+// TurnAggregates carries session-level cost and context state for the chat UI's
+// cost chip and context% bar. Fields map from the canonical msg events:
+//   - totalUsd/byModel/bySource ← the LATEST APISpendTotalEvent in the window
+//     (msg.APISpendTotalEvent: TotalUSD, ByModel, ByQuerySource). bySource is
+//     ByQuerySource renamed for the wire.
+//   - contextTokens/contextLimit ← the LATEST usage-bearing event carrying them
+//     (msg.TokenUsage.ContextTokens/ContextLimit; last-value-wins state).
+//
+// Because /messages is paginated, these are computed only from the events on
+// the returned page. If the spend/context events fall outside the page, the
+// corresponding fields stay zero (omitted) and the whole struct may be nil —
+// the client falls back to its live-tail values.
+type TurnAggregates struct {
+	TotalUSD      float64            `json:"totalUsd,omitempty"`
+	ByModel       map[string]float64 `json:"byModel,omitempty"`
+	BySource      map[string]float64 `json:"bySource,omitempty"`
+	ContextTokens int                `json:"contextTokens,omitempty"`
+	ContextLimit  int                `json:"contextLimit,omitempty"`
 }
 
 // Turn groups entries into one ordered unit; entryIds are ordered by eventId.
@@ -71,6 +115,11 @@ type TurnModel struct {
 	Entries   map[string]Entry `json:"entries"`
 	Validator Validator        `json:"validator"`
 	More      bool             `json:"more"`
+
+	// Aggregates carries session cost/context state computed from the events on
+	// this page. Nil (omitted) when no api_spend_total or context-bearing usage
+	// event is present in the window — legacy/no-cost sessions are unaffected.
+	Aggregates *TurnAggregates `json:"aggregates,omitempty"`
 }
 
 // MessagesResponse is the /sessions/{id}/messages?limit= wire shape.
@@ -190,6 +239,14 @@ func buildTurnModel(sessionID string, rows []store.EventRow, more bool) TurnMode
 
 	var maxEventID int64
 
+	// Aggregate accumulators (Phase 2). Computed from the events actually read
+	// on this page — if the spend/context events fall outside the page these
+	// stay nil/zero and the client falls back to its live-tail values. Rows are
+	// iterated in eventId-ASC order, so a later assignment is the LATEST value.
+	var latestSpend *msg.APISpendTotalEvent
+	var ctxTokens, ctxLimit int
+	var haveContext bool
+
 	for _, r := range rows {
 		if r.ID > maxEventID {
 			maxEventID = r.ID
@@ -247,6 +304,21 @@ func buildTurnModel(sessionID string, rows []store.EventRow, more bool) TurnMode
 		}
 		if isRecovered(&ev) {
 			e.Recovered = true
+		}
+		// Per-message usage: the assistant's terminating result carries the
+		// turn's TokenUsage. Attach it when non-empty; omit otherwise.
+		if ev.Type == msg.EventResult && ev.Result != nil {
+			e.Usage = entryUsageFromTokens(ev.Result.Usage)
+		}
+
+		// Aggregate sources (last-value-wins over the page). The latest
+		// api_spend_total gives totalUsd/byModel/bySource; the latest usage
+		// carrying context state gives contextTokens/contextLimit.
+		if ev.Type == msg.EventAPISpendTotal && ev.APISpendTotal != nil {
+			latestSpend = ev.APISpendTotal
+		}
+		if tks, lim, ok := contextFromEvent(&ev); ok {
+			ctxTokens, ctxLimit, haveContext = tks, lim, true
 		}
 
 		// Default annotation. Conversation atoms are shown (primary, not
@@ -342,12 +414,80 @@ func buildTurnModel(sessionID string, rows []store.EventRow, more bool) TurnMode
 	}
 
 	return TurnModel{
-		SessionID: sessionID,
-		Turns:     turns,
-		Entries:   entries,
-		Validator: validator,
-		More:      more,
+		SessionID:  sessionID,
+		Turns:      turns,
+		Entries:    entries,
+		Validator:  validator,
+		More:       more,
+		Aggregates: buildAggregates(latestSpend, ctxTokens, ctxLimit, haveContext),
 	}
+}
+
+// entryUsageFromTokens maps a canonical msg.TokenUsage to the wire EntryUsage,
+// returning nil when there is no usage to report (all mapped fields zero) so the
+// Entry.usage field is omitted. cacheCreationTokens is sourced from
+// TokenUsage.CacheWriteTokens — see EntryUsage's doc comment.
+func entryUsageFromTokens(u msg.TokenUsage) *EntryUsage {
+	if u.InputTokens == 0 && u.OutputTokens == 0 && u.CacheReadTokens == 0 && u.CacheWriteTokens == 0 {
+		return nil
+	}
+	return &EntryUsage{
+		InputTokens:         u.InputTokens,
+		OutputTokens:        u.OutputTokens,
+		CacheReadTokens:     u.CacheReadTokens,
+		CacheCreationTokens: u.CacheWriteTokens,
+	}
+}
+
+// contextFromEvent extracts ContextTokens/ContextLimit from whichever
+// usage-bearing variant an event carries (usage_total, result, api_spend_total).
+// ContextTokens/ContextLimit are last-value-wins state on msg.TokenUsage. ok is
+// false when the event carries no context state (neither field set), so the
+// caller only advances its latest value on real context-bearing events.
+func contextFromEvent(ev *msg.Event) (tokens, limit int, ok bool) {
+	var u msg.TokenUsage
+	switch {
+	case ev.UsageTotal != nil:
+		u = ev.UsageTotal.Usage
+	case ev.APISpendTotal != nil:
+		u = ev.APISpendTotal.Usage
+	case ev.Type == msg.EventResult && ev.Result != nil:
+		u = ev.Result.Usage
+	default:
+		return 0, 0, false
+	}
+	if u.ContextTokens == 0 && u.ContextLimit == 0 {
+		return 0, 0, false
+	}
+	return u.ContextTokens, u.ContextLimit, true
+}
+
+// buildAggregates assembles the TurnModel.aggregates block from the latest spend
+// event and latest context state seen on the page. Returns nil when neither is
+// present so the field is omitted (legacy/no-cost sessions unaffected). totalUsd
+// uses APISpendTotalEvent.TotalUSD, falling back to the sum of ByModel when the
+// total is zero but a per-model breakdown exists. bySource is ByQuerySource.
+func buildAggregates(spend *msg.APISpendTotalEvent, ctxTokens, ctxLimit int, haveContext bool) *TurnAggregates {
+	if spend == nil && !haveContext {
+		return nil
+	}
+	agg := &TurnAggregates{}
+	if spend != nil {
+		total := spend.TotalUSD
+		if total == 0 && len(spend.ByModel) > 0 {
+			for _, v := range spend.ByModel {
+				total += v
+			}
+		}
+		agg.TotalUSD = total
+		agg.ByModel = spend.ByModel
+		agg.BySource = spend.ByQuerySource
+	}
+	if haveContext {
+		agg.ContextTokens = ctxTokens
+		agg.ContextLimit = ctxLimit
+	}
+	return agg
 }
 
 // buildTurns groups entries into turns. A turn is one bridge TurnID's worth of
