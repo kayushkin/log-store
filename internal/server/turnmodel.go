@@ -61,23 +61,22 @@ type Entry struct {
 // all-zero usage still serializes to `{}` only when explicitly attached (the
 // pointer itself is omitted when there is no usage meta at all).
 //
-// NOTE ON NAMES: cacheCreationTokens is sourced from msg.TokenUsage.CacheWriteTokens
-// (json `cache_write_tokens`) — the canonical struct calls cache-creation
-// "write". There is NO CacheCreationTokens field on TokenUsage; the
-// per-api-call APICallEvent uses that name, but the message-level TokenUsage
-// does not. We map the concept, not a same-named field.
+// Field names mirror the canonical msg.TokenUsage (llm-bridge/msg/usage.go)
+// exactly: cacheWriteTokens ← CacheWriteTokens (json `cache_write_tokens`) —
+// the canonical struct names cache-creation "write", so the wire uses the same
+// name rather than inventing `cacheCreationTokens`.
 type EntryUsage struct {
-	InputTokens         int `json:"inputTokens,omitempty"`
-	OutputTokens        int `json:"outputTokens,omitempty"`
-	CacheReadTokens     int `json:"cacheReadTokens,omitempty"`
-	CacheCreationTokens int `json:"cacheCreationTokens,omitempty"`
+	InputTokens      int `json:"inputTokens,omitempty"`
+	OutputTokens     int `json:"outputTokens,omitempty"`
+	CacheReadTokens  int `json:"cacheReadTokens,omitempty"`
+	CacheWriteTokens int `json:"cacheWriteTokens,omitempty"`
 }
 
 // TurnAggregates carries session-level cost and context state for the chat UI's
 // cost chip and context% bar. Fields map from the canonical msg events:
-//   - totalUsd/byModel/bySource ← the LATEST APISpendTotalEvent in the window
-//     (msg.APISpendTotalEvent: TotalUSD, ByModel, ByQuerySource). bySource is
-//     ByQuerySource renamed for the wire.
+//   - totalUsd/byModel/byQuerySource ← the LATEST APISpendTotalEvent in the
+//     window (msg.APISpendTotalEvent: TotalUSD, ByModel, ByQuerySource). Wire
+//     names mirror the canonical fields exactly.
 //   - contextTokens/contextLimit ← the LATEST usage-bearing event carrying them
 //     (msg.TokenUsage.ContextTokens/ContextLimit; last-value-wins state).
 //
@@ -88,7 +87,7 @@ type EntryUsage struct {
 type TurnAggregates struct {
 	TotalUSD      float64            `json:"totalUsd,omitempty"`
 	ByModel       map[string]float64 `json:"byModel,omitempty"`
-	BySource      map[string]float64 `json:"bySource,omitempty"`
+	ByQuerySource map[string]float64 `json:"byQuerySource,omitempty"`
 	ContextTokens int                `json:"contextTokens,omitempty"`
 	ContextLimit  int                `json:"contextLimit,omitempty"`
 }
@@ -312,7 +311,7 @@ func buildTurnModel(sessionID string, rows []store.EventRow, more bool) TurnMode
 		}
 
 		// Aggregate sources (last-value-wins over the page). The latest
-		// api_spend_total gives totalUsd/byModel/bySource; the latest usage
+		// api_spend_total gives totalUsd/byModel/byQuerySource; the latest usage
 		// carrying context state gives contextTokens/contextLimit.
 		if ev.Type == msg.EventAPISpendTotal && ev.APISpendTotal != nil {
 			latestSpend = ev.APISpendTotal
@@ -425,17 +424,16 @@ func buildTurnModel(sessionID string, rows []store.EventRow, more bool) TurnMode
 
 // entryUsageFromTokens maps a canonical msg.TokenUsage to the wire EntryUsage,
 // returning nil when there is no usage to report (all mapped fields zero) so the
-// Entry.usage field is omitted. cacheCreationTokens is sourced from
-// TokenUsage.CacheWriteTokens — see EntryUsage's doc comment.
+// Entry.usage field is omitted. Field names mirror msg.TokenUsage exactly.
 func entryUsageFromTokens(u msg.TokenUsage) *EntryUsage {
 	if u.InputTokens == 0 && u.OutputTokens == 0 && u.CacheReadTokens == 0 && u.CacheWriteTokens == 0 {
 		return nil
 	}
 	return &EntryUsage{
-		InputTokens:         u.InputTokens,
-		OutputTokens:        u.OutputTokens,
-		CacheReadTokens:     u.CacheReadTokens,
-		CacheCreationTokens: u.CacheWriteTokens,
+		InputTokens:      u.InputTokens,
+		OutputTokens:     u.OutputTokens,
+		CacheReadTokens:  u.CacheReadTokens,
+		CacheWriteTokens: u.CacheWriteTokens,
 	}
 }
 
@@ -466,7 +464,7 @@ func contextFromEvent(ev *msg.Event) (tokens, limit int, ok bool) {
 // event and latest context state seen on the page. Returns nil when neither is
 // present so the field is omitted (legacy/no-cost sessions unaffected). totalUsd
 // uses APISpendTotalEvent.TotalUSD, falling back to the sum of ByModel when the
-// total is zero but a per-model breakdown exists. bySource is ByQuerySource.
+// total is zero but a per-model breakdown exists.
 func buildAggregates(spend *msg.APISpendTotalEvent, ctxTokens, ctxLimit int, haveContext bool) *TurnAggregates {
 	if spend == nil && !haveContext {
 		return nil
@@ -481,7 +479,7 @@ func buildAggregates(spend *msg.APISpendTotalEvent, ctxTokens, ctxLimit int, hav
 		}
 		agg.TotalUSD = total
 		agg.ByModel = spend.ByModel
-		agg.BySource = spend.ByQuerySource
+		agg.ByQuerySource = spend.ByQuerySource
 	}
 	if haveContext {
 		agg.ContextTokens = ctxTokens

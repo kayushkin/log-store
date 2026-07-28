@@ -326,7 +326,7 @@ func TestBuildTurnModel_TurnGrouping(t *testing.T) {
 }
 
 // Phase 2: an assistant result carrying usage meta populates Entry.usage,
-// mapped from msg.TokenUsage (cacheCreationTokens ← CacheWriteTokens).
+// mapped from msg.TokenUsage (cacheWriteTokens ← CacheWriteTokens).
 func TestBuildTurnModel_EntryUsage_Populated(t *testing.T) {
 	base := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
 	rows := []store.EventRow{
@@ -346,7 +346,7 @@ func TestBuildTurnModel_EntryUsage_Populated(t *testing.T) {
 	if got == nil {
 		t.Fatalf("result entry should carry usage")
 	}
-	if got.InputTokens != 100 || got.OutputTokens != 40 || got.CacheReadTokens != 12 || got.CacheCreationTokens != 7 {
+	if got.InputTokens != 100 || got.OutputTokens != 40 || got.CacheReadTokens != 12 || got.CacheWriteTokens != 7 {
 		t.Errorf("usage mapped wrong: %+v", got)
 	}
 
@@ -361,7 +361,7 @@ func TestBuildTurnModel_EntryUsage_Populated(t *testing.T) {
 	if err := json.Unmarshal(blob, &probe); err != nil {
 		t.Fatalf("unmarshal entry: %v", err)
 	}
-	if probe.Usage == nil || probe.Usage.CacheCreationTokens != 7 {
+	if probe.Usage == nil || probe.Usage.CacheWriteTokens != 7 {
 		t.Errorf("usage did not round-trip under camelCase key: %s", blob)
 	}
 }
@@ -385,7 +385,7 @@ func TestBuildTurnModel_EntryUsage_OmittedWhenZero(t *testing.T) {
 }
 
 // Phase 2: an api_spend_total event + a context-bearing usage_total event
-// populate TurnModel.aggregates (totalUsd/byModel/bySource + context state).
+// populate TurnModel.aggregates (totalUsd/byModel/byQuerySource + context state).
 func TestBuildTurnModel_Aggregates_Populated(t *testing.T) {
 	base := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
 	rows := []store.EventRow{
@@ -415,8 +415,8 @@ func TestBuildTurnModel_Aggregates_Populated(t *testing.T) {
 	if agg.ByModel["opus"] != 0.07 || agg.ByModel["haiku"] != 0.0004 {
 		t.Errorf("byModel wrong: %+v", agg.ByModel)
 	}
-	if agg.BySource["main"] != 0.07 || agg.BySource["generate_session_title"] != 0.0004 {
-		t.Errorf("bySource (from ByQuerySource) wrong: %+v", agg.BySource)
+	if agg.ByQuerySource["main"] != 0.07 || agg.ByQuerySource["generate_session_title"] != 0.0004 {
+		t.Errorf("byQuerySource wrong: %+v", agg.ByQuerySource)
 	}
 	if agg.ContextTokens != 34000 || agg.ContextLimit != 200000 {
 		t.Errorf("context state wrong: tokens=%d limit=%d", agg.ContextTokens, agg.ContextLimit)
