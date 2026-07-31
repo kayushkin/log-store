@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 )
 
 // newTestStore opens a Store backed by a throwaway SQLite file under the test's
@@ -50,7 +52,7 @@ func TestNewCreatesSchemaAndClose(t *testing.T) {
 	// Both tables must exist after New() runs migrate().
 	for _, tbl := range []string{"events", "sessions"} {
 		var name string
-		err := s.db.QueryRow(
+		err := s.reader.QueryRow(
 			`SELECT name FROM sqlite_master WHERE type='table' AND name=?`, tbl,
 		).Scan(&name)
 		if err != nil {
@@ -61,9 +63,13 @@ func TestNewCreatesSchemaAndClose(t *testing.T) {
 		}
 	}
 
-	// Pool is pinned to a single connection (see store.go rationale).
-	if got := s.db.Stats().MaxOpenConnections; got != 1 {
-		t.Errorf("MaxOpenConnections = %d, want 1", got)
+	// Writes stay pinned to a single connection (see store.go rationale);
+	// reads get a pool of their own so a long query can't stall ingest.
+	if got := s.writer.Stats().MaxOpenConnections; got != 1 {
+		t.Errorf("writer MaxOpenConnections = %d, want 1", got)
+	}
+	if got := s.reader.Stats().MaxOpenConnections; got != readerPoolSize {
+		t.Errorf("reader MaxOpenConnections = %d, want %d", got, readerPoolSize)
 	}
 }
 
@@ -363,7 +369,7 @@ func TestProjectionSurvivesReopenWithBackfill(t *testing.T) {
 	s1.StoreEvent("sess", "result", resultEvent(7, 3, 0.5, 99, "mdl"))
 
 	// Drop the projection rows so reopening must rebuild them from events.
-	if _, err := s1.db.Exec(`DELETE FROM sessions`); err != nil {
+	if _, err := s1.writer.Exec(`DELETE FROM sessions`); err != nil {
 		t.Fatalf("delete sessions: %v", err)
 	}
 	if err := s1.Close(); err != nil {
@@ -440,5 +446,113 @@ func TestInjectEventID(t *testing.T) {
 	in := []byte(`[1,2,3]`)
 	if got := injectEventID(in, 9); string(got) != string(in) {
 		t.Errorf("non-object injection = %q, want unchanged %q", got, in)
+	}
+}
+
+// TestAWriteThroughTheReaderPoolIsRefused pins the pragma that keeps reads and
+// writes apart. query_only is a PER-CONNECTION pragma, and a pool hands out
+// whichever connection is free — so setting it once with an Exec would land on
+// one connection and leave the rest able to write. The DSN form is supposed to
+// apply it to every connection modernc opens; this drives enough concurrent
+// writes to force the pool wide open and requires every one of them to fail.
+//
+// Asserting the refusal rather than reading `PRAGMA query_only` back is
+// deliberate: the readout has been seen to report the value it was set to on a
+// connection that then accepted the write. The behaviour is the contract.
+func TestAWriteThroughTheReaderPoolIsRefused(t *testing.T) {
+	s := newTestStore(t)
+	if _, err := s.StoreEvent("sess", "user_message", []byte(`{}`)); err != nil {
+		t.Fatalf("seed StoreEvent: %v", err)
+	}
+
+	const attempts = 40
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var accepted int
+	start := make(chan struct{})
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			if _, err := s.reader.Exec(
+				`INSERT INTO events (session_id, type, data) VALUES (?,?,?)`,
+				"smuggled", "user_message", `{}`,
+			); err == nil {
+				mu.Lock()
+				accepted++
+				mu.Unlock()
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if accepted != 0 {
+		t.Errorf("%d of %d writes through the reader pool were accepted, want 0", accepted, attempts)
+	}
+	var n int
+	if err := s.reader.QueryRow(`SELECT count(*) FROM events`).Scan(&n); err != nil {
+		t.Fatalf("count events: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("events table holds %d rows, want the 1 seeded row", n)
+	}
+}
+
+// TestALongReadDoesNotStallAWrite is the assertion the whole change exists for.
+// While reads and writes shared one pinned connection, an open *sql.Rows held
+// that connection for its entire scan, so every event ingest across every live
+// session queued behind it — 573ms for the largest real session, measured on a
+// copy of the live database.
+//
+// Sabotage that proves it is curative: point the reader at s.writer and this
+// deadlocks until the read finishes.
+func TestALongReadDoesNotStallAWrite(t *testing.T) {
+	s := newTestStore(t)
+	for i := 0; i < 500; i++ {
+		if _, err := s.StoreEvent("sess", "stream", []byte(`{}`)); err != nil {
+			t.Fatalf("seed StoreEvent %d: %v", i, err)
+		}
+	}
+
+	// Hold a read open mid-scan: one row consumed, the rest still pending, so
+	// the connection serving it stays checked out of the pool.
+	rows, err := s.reader.Query(`SELECT id, data FROM events ORDER BY id`)
+	if err != nil {
+		t.Fatalf("open long read: %v", err)
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		t.Fatalf("expected at least one row: %v", rows.Err())
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.StoreEvent("sess", "user_message", []byte(`{}`))
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("write during an open read: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a write blocked behind an open read — reads and writes are sharing a connection")
+	}
+
+	// The reader must also still be usable after the write, and must see it:
+	// two handles on one WAL file, so a read opened later has to observe rows
+	// the writer committed in between.
+	rows.Close()
+	var n int
+	if err := s.reader.QueryRow(
+		`SELECT count(*) FROM events WHERE type='user_message'`,
+	).Scan(&n); err != nil {
+		t.Fatalf("count after write: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("reader sees %d user_message rows, want 1 — the reader pool is on a stale snapshot", n)
 	}
 }

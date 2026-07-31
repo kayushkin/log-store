@@ -11,8 +11,33 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// readerPoolSize bounds how many queries run at once. Reads here are not
+// small — one /messages call over the largest real session scans 13,776 rows
+// and serialises 306MB — so an unbounded pool would let a handful of clients
+// pin every core. Eight is well above the number of dashboards this serves
+// and still leaves the machine room to run the harnesses that feed it.
+const readerPoolSize = 8
+
 type Store struct {
-	db *sql.DB
+	// writer runs every INSERT and UPDATE through a single connection.
+	// modernc.org/sqlite treats each pooled connection as an independent
+	// writer, so more than one still hits SQLITE_BUSY (5) under concurrent
+	// ingest and silently drops events when the caller swallows the 500.
+	writer *sql.DB
+
+	// reader runs every SELECT on its own pool. Under WAL a reader never
+	// blocks the writer, so a query can no longer stall event ingest for
+	// every live session. Measured on the live 1.9GB database: draining the
+	// largest session's events holds its connection for 573ms, and while
+	// reads and writes shared this one connection that was 573ms in which
+	// no session anywhere could log an event. Opened query_only so a write
+	// routed here fails loudly instead of quietly competing for the lock.
+	//
+	// Honest about the size of the win: an end-to-end A/B (sustained reads
+	// against old and new binaries on a copy of the live database) could
+	// not separate them — the effect sits inside the noise of a busy box.
+	// This is a correctness change, not a measured speedup.
+	reader *sql.DB
 }
 
 func New(dbPath string) (*Store, error) {
@@ -20,33 +45,50 @@ func New(dbPath string) (*Store, error) {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, fmt.Errorf("create db dir: %w", err)
 	}
-	d, err := sql.Open("sqlite", dbPath)
+	writer, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := d.Exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;"); err != nil {
-		d.Close()
+	// journal_mode is a property of the database file, so this one Exec sets
+	// WAL for the reader pool too. busy_timeout is per-connection and the
+	// reader carries its own in the DSN below.
+	if _, err := writer.Exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;"); err != nil {
+		writer.Close()
 		return nil, fmt.Errorf("sqlite pragmas: %w", err)
 	}
+	writer.SetMaxOpenConns(1)
 
-	// Single connection serializes writes through Go's sql pool. Without this,
-	// modernc.org/sqlite still hits SQLITE_BUSY (5) under concurrent writers,
-	// silently dropping events (e.g. user_message via PushEvent) when the
-	// caller swallows the 500.
-	d.SetMaxOpenConns(1)
+	// modernc applies _pragma= to every connection it opens, which a one-shot
+	// Exec on a pool cannot do — query_only and busy_timeout are both
+	// per-connection. Verified by behaviour, not by reading the pragma back:
+	// TestAWriteThroughTheReaderPoolIsRefused drives 40 concurrent writes
+	// through this handle and every one must fail.
+	reader, err := sql.Open("sqlite", dbPath+"?_pragma=query_only(1)&_pragma=busy_timeout(5000)")
+	if err != nil {
+		writer.Close()
+		return nil, err
+	}
+	reader.SetMaxOpenConns(readerPoolSize)
 
-	s := &Store{db: d}
+	s := &Store{writer: writer, reader: reader}
 	if err := s.migrate(); err != nil {
-		d.Close()
+		writer.Close()
+		reader.Close()
 		return nil, err
 	}
 	return s, nil
 }
 
-func (s *Store) Close() error { return s.db.Close() }
+func (s *Store) Close() error {
+	rerr := s.reader.Close()
+	if err := s.writer.Close(); err != nil {
+		return err
+	}
+	return rerr
+}
 
 func (s *Store) migrate() error {
-	if _, err := s.db.Exec(`
+	if _, err := s.writer.Exec(`
 		CREATE TABLE IF NOT EXISTS events (
 			id         INTEGER PRIMARY KEY AUTOINCREMENT,
 			session_id TEXT NOT NULL,
@@ -63,7 +105,7 @@ func (s *Store) migrate() error {
 	// totals derived from the events table. Maintained synchronously by
 	// StoreEvent so reads are O(1) instead of O(events). Always rebuildable
 	// from events; backfilled below if rows are missing.
-	if _, err := s.db.Exec(`
+	if _, err := s.writer.Exec(`
 		CREATE TABLE IF NOT EXISTS sessions (
 			session_id    TEXT PRIMARY KEY,
 			turn_count    INTEGER NOT NULL DEFAULT 0,
@@ -82,7 +124,7 @@ func (s *Store) migrate() error {
 	}
 	// Backfill from events for any session not already projected. Runs once
 	// per session — guarded by NOT IN to skip already-populated sessions.
-	if _, err := s.db.Exec(`
+	if _, err := s.writer.Exec(`
 		INSERT INTO sessions (
 			session_id, turn_count, input_tokens, output_tokens,
 			cost_usd, duration_ms, model, started_at, last_active, ended_at
@@ -123,7 +165,7 @@ func (s *Store) migrate() error {
 // next StoreEvent call rolls forward correctly, and on next boot migrate()
 // will not re-backfill an already-present row).
 func (s *Store) StoreEvent(sessionID, eventType string, data []byte) (int64, error) {
-	result, err := s.db.Exec(
+	result, err := s.writer.Exec(
 		`INSERT INTO events (session_id, type, data) VALUES (?,?,?)`,
 		sessionID, eventType, string(data),
 	)
@@ -145,14 +187,14 @@ func (s *Store) updateSessionProjection(sessionID, eventType string, data []byte
 	// Ensure the row exists. INSERT OR IGNORE is a no-op for established
 	// sessions; for the first event of a new session it seeds started_at /
 	// last_active to NOW().
-	if _, err := s.db.Exec(
+	if _, err := s.writer.Exec(
 		`INSERT OR IGNORE INTO sessions (session_id) VALUES (?)`,
 		sessionID,
 	); err != nil {
 		return fmt.Errorf("seed sessions row: %w", err)
 	}
 	// Bump last_active on every event regardless of type.
-	if _, err := s.db.Exec(
+	if _, err := s.writer.Exec(
 		`UPDATE sessions SET last_active = CURRENT_TIMESTAMP WHERE session_id = ?`,
 		sessionID,
 	); err != nil {
@@ -160,7 +202,7 @@ func (s *Store) updateSessionProjection(sessionID, eventType string, data []byte
 	}
 	switch eventType {
 	case "user_message":
-		_, err := s.db.Exec(
+		_, err := s.writer.Exec(
 			`UPDATE sessions SET turn_count = turn_count + 1 WHERE session_id = ?`,
 			sessionID,
 		)
@@ -187,13 +229,13 @@ func (s *Store) updateSessionProjection(sessionID, eventType string, data []byte
 			log.Printf("[log-store] decode result event %s: %v", sessionID, err)
 			// Still set ended_at — the event terminated the turn even if
 			// the body was malformed.
-			_, err := s.db.Exec(
+			_, err := s.writer.Exec(
 				`UPDATE sessions SET ended_at = CURRENT_TIMESTAMP WHERE session_id = ?`,
 				sessionID,
 			)
 			return err
 		}
-		_, err := s.db.Exec(
+		_, err := s.writer.Exec(
 			`UPDATE sessions SET
 				input_tokens = input_tokens + ?,
 				output_tokens = output_tokens + ?,
@@ -211,7 +253,7 @@ func (s *Store) updateSessionProjection(sessionID, eventType string, data []byte
 		)
 		return err
 	case "error":
-		_, err := s.db.Exec(
+		_, err := s.writer.Exec(
 			`UPDATE sessions SET ended_at = CURRENT_TIMESTAMP WHERE session_id = ?`,
 			sessionID,
 		)
@@ -234,7 +276,7 @@ func (s *Store) ListEvents(sessionID string, types []string) ([]json.RawMessage,
 		}
 	}
 	q += ` ORDER BY id ASC`
-	rows, err := s.db.Query(q, args...)
+	rows, err := s.reader.Query(q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -263,7 +305,7 @@ func (s *Store) ListEventsSinceID(sessionID string, afterID int, types []string)
 		}
 	}
 	q += ` ORDER BY id ASC`
-	rows, err := s.db.Query(q, args...)
+	rows, err := s.reader.Query(q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -321,7 +363,7 @@ func (s *Store) SearchSessions(query string, limit int) ([]SearchHit, error) {
 	if limit <= 0 {
 		limit = 100
 	}
-	rows, err := s.db.Query(
+	rows, err := s.reader.Query(
 		`SELECT session_id, COUNT(*) AS n
 		 FROM events
 		 WHERE data LIKE '%' || ? || '%'
@@ -373,7 +415,7 @@ type SessionAggregateRow struct {
 // implementation accidentally counted result events as "turns"; the
 // projection's turn_count field is the corrected definition.
 func (s *Store) ListSessionAggregates() ([]SessionAggregateRow, error) {
-	rows, err := s.db.Query(`
+	rows, err := s.reader.Query(`
 		SELECT session_id, turn_count, input_tokens, output_tokens,
 		       cost_usd, duration_ms, model
 		FROM sessions
@@ -411,14 +453,14 @@ type TurnState struct {
 // session along with the derived in-flight flag.
 func (s *Store) TurnState(sessionID string) (TurnState, error) {
 	var ts TurnState
-	row := s.db.QueryRow(
+	row := s.reader.QueryRow(
 		`SELECT COALESCE(MAX(id), 0) FROM events WHERE session_id=? AND type='user_message'`,
 		sessionID,
 	)
 	if err := row.Scan(&ts.LastUserMessageEventID); err != nil {
 		return ts, err
 	}
-	row = s.db.QueryRow(
+	row = s.reader.QueryRow(
 		`SELECT COALESCE(MAX(id), 0) FROM events WHERE session_id=? AND type IN ('result','error')`,
 		sessionID,
 	)
@@ -431,7 +473,7 @@ func (s *Store) TurnState(sessionID string) (TurnState, error) {
 
 // SessionIDs returns all distinct session IDs that have events.
 func (s *Store) SessionIDs() ([]string, error) {
-	rows, err := s.db.Query(`SELECT DISTINCT session_id FROM events ORDER BY session_id`)
+	rows, err := s.reader.Query(`SELECT DISTINCT session_id FROM events ORDER BY session_id`)
 	if err != nil {
 		return nil, err
 	}
