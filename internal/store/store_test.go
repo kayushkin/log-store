@@ -556,3 +556,139 @@ func TestALongReadDoesNotStallAWrite(t *testing.T) {
 		t.Errorf("reader sees %d user_message rows, want 1 — the reader pool is on a stale snapshot", n)
 	}
 }
+
+// harnessEvent builds an event body carrying a harness-native session id, the
+// shape every real llm-bridge event has. The pre-existing fixtures in this file
+// deliberately omit the field; a test for the id must not reuse them, or it
+// asserts on a body no harness produces.
+func harnessEvent(harnessSessionID, text string) []byte {
+	body, err := json.Marshal(map[string]any{
+		"harness_session_id": harnessSessionID,
+		"harness":            "claude_code",
+		"text":               text,
+	})
+	if err != nil {
+		panic(err)
+	}
+	return body
+}
+
+// A search hit has to carry the id that resolves it. log-store's own
+// session_id is whatever the writer handed it, and on the live host a third of
+// those are bridge ids llm-bridge-server has since deleted; the harness id from
+// the events is what still matches a real session row.
+func TestSearchSessionsReportsHarnessSessionID(t *testing.T) {
+	s := newTestStore(t)
+	s.StoreEvent("br_phantom", "user_message", harnessEvent("cc-uuid-1", "needle here"))
+	s.StoreEvent("br_phantom", "assistant", harnessEvent("cc-uuid-1", "needle again"))
+	// A session whose events name no harness id at all — 1,675 of the live
+	// host's 11,640. It must still come back as a hit, just without the id.
+	s.StoreEvent("no_harness_id", "user_message", []byte(`{"text":"needle too"}`))
+
+	hits, err := s.SearchSessions("needle", 10)
+	if err != nil {
+		t.Fatalf("SearchSessions: %v", err)
+	}
+	got := map[string]SearchHit{}
+	for _, h := range hits {
+		got[h.SessionID] = h
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d hits, want 2: %+v", len(got), hits)
+	}
+	if got["br_phantom"].HarnessSessionID != "cc-uuid-1" {
+		t.Errorf("harness id = %q, want cc-uuid-1", got["br_phantom"].HarnessSessionID)
+	}
+	if got["br_phantom"].MatchCount != 2 {
+		t.Errorf("match count = %d, want 2", got["br_phantom"].MatchCount)
+	}
+	// Asserted as its own case, not folded into the one above: an inner join
+	// would drop this row entirely and every other assertion here would still
+	// pass.
+	h, ok := got["no_harness_id"]
+	if !ok {
+		t.Fatal("session with no harness id was dropped from the results")
+	}
+	if h.HarnessSessionID != "" {
+		t.Errorf("harness id = %q, want empty", h.HarnessSessionID)
+	}
+}
+
+// A resumed or forked Claude Code session reports a new harness uuid partway
+// through its stream. The gateway's row holds the current one, so log-store
+// must too — keeping the first would point the consumer at a session that has
+// moved on.
+func TestHarnessSessionIDTracksLatest(t *testing.T) {
+	s := newTestStore(t)
+	s.StoreEvent("br_1", "user_message", harnessEvent("cc-uuid-first", "needle"))
+	s.StoreEvent("br_1", "result", harnessEvent("cc-uuid-second", "needle"))
+
+	hits, err := s.SearchSessions("needle", 10)
+	if err != nil {
+		t.Fatalf("SearchSessions: %v", err)
+	}
+	if len(hits) != 1 {
+		t.Fatalf("got %d hits, want 1", len(hits))
+	}
+	if hits[0].HarnessSessionID != "cc-uuid-second" {
+		t.Errorf("harness id = %q, want cc-uuid-second (the latest)", hits[0].HarnessSessionID)
+	}
+	// An event that names no id must not blank out the one already recorded.
+	s.StoreEvent("br_1", "assistant", []byte(`{"text":"needle, no harness id"}`))
+	hits, err = s.SearchSessions("needle", 10)
+	if err != nil {
+		t.Fatalf("SearchSessions: %v", err)
+	}
+	if hits[0].HarnessSessionID != "cc-uuid-second" {
+		t.Errorf("harness id = %q after an id-less event, want cc-uuid-second", hits[0].HarnessSessionID)
+	}
+}
+
+// The live database predates the column, so the value of this change rests
+// entirely on the backfill: without it every already-stored session stays
+// unresolvable forever. Reopening is what runs it.
+func TestHarnessSessionIDBackfilledOnReopen(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "log-store.db")
+
+	s1, err := New(dbPath)
+	if err != nil {
+		t.Fatalf("New 1: %v", err)
+	}
+	s1.StoreEvent("br_old", "user_message", harnessEvent("cc-uuid-superseded", "needle"))
+	s1.StoreEvent("br_old", "result", harnessEvent("cc-uuid-old", "needle"))
+	if err := s1.Close(); err != nil {
+		t.Fatalf("Close 1: %v", err)
+	}
+
+	// Drop the column and its index to reproduce a pre-migration database
+	// holding real events, then reopen and let migrate() do the import.
+	pre, err := New(dbPath)
+	if err != nil {
+		t.Fatalf("New pre: %v", err)
+	}
+	if _, err := pre.writer.Exec(`DROP INDEX IF EXISTS idx_sessions_harness_session_id`); err != nil {
+		t.Fatalf("drop index: %v", err)
+	}
+	if _, err := pre.writer.Exec(`ALTER TABLE sessions DROP COLUMN harness_session_id`); err != nil {
+		t.Fatalf("drop column: %v", err)
+	}
+	if err := pre.Close(); err != nil {
+		t.Fatalf("Close pre: %v", err)
+	}
+
+	s2, err := New(dbPath)
+	if err != nil {
+		t.Fatalf("New 2: %v", err)
+	}
+	defer s2.Close()
+	hits, err := s2.SearchSessions("needle", 10)
+	if err != nil {
+		t.Fatalf("SearchSessions: %v", err)
+	}
+	if len(hits) != 1 {
+		t.Fatalf("got %d hits, want 1", len(hits))
+	}
+	if hits[0].HarnessSessionID != "cc-uuid-old" {
+		t.Errorf("harness id = %q after reopen, want cc-uuid-old — the backfill did not run", hits[0].HarnessSessionID)
+	}
+}

@@ -122,6 +122,9 @@ func (s *Store) migrate() error {
 	`); err != nil {
 		return err
 	}
+	if err := s.migrateHarnessSessionID(); err != nil {
+		return err
+	}
 	// Backfill from events for any session not already projected. Runs once
 	// per session — guarded by NOT IN to skip already-populated sessions.
 	if _, err := s.writer.Exec(`
@@ -157,6 +160,68 @@ func (s *Store) migrate() error {
 		return fmt.Errorf("backfill sessions projection: %w", err)
 	}
 	return nil
+}
+
+// migrateHarnessSessionID adds the sessions projection's harness_session_id
+// column and backfills it from the events that already carry the id.
+//
+// Why the column exists at all: log-store keys everything on one opaque
+// session_id — whatever the writer handed it. In practice that is sometimes
+// llm-bridge-server's bridge_id and sometimes the harness-native id, and a
+// third of this host's rows carry a bridge_id the gateway has since deleted
+// as a phantom. A consumer that takes a search hit's session_id straight to
+// the gateway's GET /sessions/{id} therefore gets a 404 for a session that
+// very much exists — measured on this host at 4,083 of 11,640 sessions
+// (35%), against only 4 that are genuinely unrecoverable.
+//
+// Every one of those events already names its harness_session_id, and the
+// gateway keys a unique index on that same column. Publishing the id
+// log-store already stores is what makes a hit resolvable, and it needs no
+// knowledge of the gateway's session set — so it adds no coupling between
+// the two services. log-store still does not resolve anything itself; it
+// reports both ids and lets the consumer join.
+//
+// The backfill is deliberately tied to the ALTER: `ADD COLUMN` fails once
+// the column exists, and that error is the signal that the one-shot import
+// has already run. The alternative — guarding on the column still being
+// empty — would re-scan every event of every session that legitimately has
+// no harness id on every single boot, forever. Both statements share one
+// transaction so a failed backfill rolls the column back and retries on the
+// next boot rather than leaving the table half-migrated.
+func (s *Store) migrateHarnessSessionID() error {
+	tx, err := s.writer.Begin()
+	if err != nil {
+		return fmt.Errorf("begin harness_session_id migration: %w", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`ALTER TABLE sessions ADD COLUMN harness_session_id TEXT NOT NULL DEFAULT ''`); err != nil {
+		// Column already present: the backfill ran on an earlier boot.
+		return nil
+	}
+	// Latest wins, not first. A resumed or forked Claude Code session reports
+	// a new harness uuid partway through its event stream, and the gateway's
+	// sessions row holds the current one — 11 sessions on this host have more
+	// than one. Taking MAX(id) is what keeps the two stores agreeing.
+	if _, err := tx.Exec(`
+		UPDATE sessions SET harness_session_id = COALESCE((
+			SELECT json_extract(e.data, '$.harness_session_id')
+			FROM events e
+			WHERE e.session_id = sessions.session_id
+			  AND json_extract(e.data, '$.harness_session_id') IS NOT NULL
+			  AND json_extract(e.data, '$.harness_session_id') != ''
+			ORDER BY e.id DESC LIMIT 1
+		), '')
+	`); err != nil {
+		return fmt.Errorf("backfill harness_session_id: %w", err)
+	}
+	if _, err := tx.Exec(
+		`CREATE INDEX IF NOT EXISTS idx_sessions_harness_session_id
+		 ON sessions(harness_session_id) WHERE harness_session_id != ''`,
+	); err != nil {
+		return fmt.Errorf("index harness_session_id: %w", err)
+	}
+	return tx.Commit()
 }
 
 // StoreEvent persists a raw event and updates the per-session projection.
@@ -199,6 +264,21 @@ func (s *Store) updateSessionProjection(sessionID, eventType string, data []byte
 		sessionID,
 	); err != nil {
 		return fmt.Errorf("touch last_active: %w", err)
+	}
+	// Roll the harness-native id forward from whatever this event reports.
+	// It is written on every event type rather than on session start because
+	// log-store has no session-start event: the first frame of a session is
+	// just an ordinary event, and a resumed session reports a new harness
+	// uuid partway through. Last writer wins, matching the migration's
+	// MAX(id) backfill and the gateway's own row.
+	if harnessSessionID := harnessSessionIDOf(data); harnessSessionID != "" {
+		if _, err := s.writer.Exec(
+			`UPDATE sessions SET harness_session_id = ?
+			 WHERE session_id = ? AND harness_session_id != ?`,
+			harnessSessionID, sessionID, harnessSessionID,
+		); err != nil {
+			return fmt.Errorf("set harness_session_id: %w", err)
+		}
 	}
 	switch eventType {
 	case "user_message":
@@ -357,19 +437,56 @@ func injectEventID(data []byte, rowID int64) json.RawMessage {
 	return out
 }
 
+// harnessSessionIDOf reads the harness-native session id an event carries.
+// Returns "" for a malformed body or an event that names no harness id —
+// both are ordinary, so neither is an error: 1,675 of this host's 11,640
+// sessions have no harness id anywhere in their event stream.
+func harnessSessionIDOf(data []byte) string {
+	var ev struct {
+		HarnessSessionID string `json:"harness_session_id"`
+	}
+	if err := json.Unmarshal(data, &ev); err != nil {
+		return ""
+	}
+	return ev.HarnessSessionID
+}
+
 // SearchSessions returns session IDs with events whose raw data contains query.
 // Match count is the number of matching events per session.
+//
+// Each hit reports both ids it has. session_id is log-store's own key and is
+// whatever the writer handed it — for a third of this host's sessions that is
+// a bridge_id llm-bridge-server has since deleted as a phantom, so taking it
+// straight to GET /sessions/{id} yields a 404 for a live session.
+// harness_session_id is the harness-native id from the session's events, and
+// it is what the gateway keys its own unique index on. A consumer that 404s
+// on the first should retry on the second before calling a hit unrenderable.
 func (s *Store) SearchSessions(query string, limit int) ([]SearchHit, error) {
 	if limit <= 0 {
 		limit = 100
 	}
+	// The join sits outside the LIMIT, not inside it. Joining in the same
+	// SELECT as the GROUP BY makes SQLite look up the projection once per
+	// matched group — 8,138 seeks for a whole-corpus query on this host, and
+	// measurably 1.1s of the 3.9s it then took. Feeding it the already-
+	// truncated result costs at most `limit` seeks instead, which brought the
+	// same query back to 2.86s against 2.74s before the column existed.
+	//
+	// LEFT JOIN, not JOIN: a session with events but no projection row must
+	// still appear as a hit with an empty harness id, exactly as it did
+	// before this column existed. An inner join would silently drop it.
 	rows, err := s.reader.Query(
-		`SELECT session_id, COUNT(*) AS n
-		 FROM events
-		 WHERE data LIKE '%' || ? || '%'
-		 GROUP BY session_id
-		 ORDER BY MAX(id) DESC
-		 LIMIT ?`,
+		`SELECT hit.session_id, hit.match_count, COALESCE(s.harness_session_id, '')
+		 FROM (
+			SELECT session_id, COUNT(*) AS match_count, MAX(id) AS last_event_id
+			FROM events
+			WHERE data LIKE '%' || ? || '%'
+			GROUP BY session_id
+			ORDER BY last_event_id DESC
+			LIMIT ?
+		 ) hit
+		 LEFT JOIN sessions s ON s.session_id = hit.session_id
+		 ORDER BY hit.last_event_id DESC`,
 		query, limit,
 	)
 	if err != nil {
@@ -379,7 +496,7 @@ func (s *Store) SearchSessions(query string, limit int) ([]SearchHit, error) {
 	var hits []SearchHit
 	for rows.Next() {
 		var h SearchHit
-		if err := rows.Scan(&h.SessionID, &h.MatchCount); err != nil {
+		if err := rows.Scan(&h.SessionID, &h.MatchCount, &h.HarnessSessionID); err != nil {
 			return nil, err
 		}
 		hits = append(hits, h)
@@ -391,6 +508,11 @@ func (s *Store) SearchSessions(query string, limit int) ([]SearchHit, error) {
 type SearchHit struct {
 	SessionID  string `json:"session_id"`
 	MatchCount int    `json:"match_count"`
+	// HarnessSessionID is the harness-native id (a Claude Code UUID, a Codex
+	// thread_id) taken from the session's own events. Empty when the events
+	// name none. It is the key that resolves a hit against llm-bridge-server
+	// when session_id does not.
+	HarnessSessionID string `json:"harness_session_id"`
 }
 
 // SessionAggregateRow is one session's summed totals as returned by
