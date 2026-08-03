@@ -515,6 +515,68 @@ type SearchHit struct {
 	HarnessSessionID string `json:"harness_session_id"`
 }
 
+// HeldSession names one log-store session that already holds a transcript,
+// as reported by SessionsHoldingHarnessSessionID.
+type HeldSession struct {
+	// SessionID is log-store's own key for the transcript — whatever the
+	// writer handed it. Usually an llm-bridge-server bridge id, and for a
+	// third of this host's rows a bridge id the gateway has since deleted.
+	SessionID string `json:"session_id"`
+	// EventCount is how many events this session holds. Counted from the
+	// events table rather than read off the projection, because the caller
+	// is asking whether a transcript is already durable and the projection
+	// counts turns, not events.
+	EventCount int `json:"event_count"`
+	// LastActive is the projection's last-activity stamp for the session.
+	LastActive string `json:"last_active"`
+}
+
+// SessionsHoldingHarnessSessionID answers "do you already hold this
+// harness session's transcript?" — the question llm-bridge-server's
+// discovery has to ask before importing one.
+//
+// Discovery decides a session is new by asking its OWN database, then writes
+// the answer's consequence into log-store. A gateway booted with a fresh
+// database and the default log-store URL therefore re-imports every
+// transcript on disk; that is how 2,863 duplicate sessions reached this
+// host's production log-store on 2026-08-01. The dedupe key has to live in
+// the store that holds the writes, and the only id both services agree on is
+// the harness-native one.
+//
+// An empty id is refused rather than answered. Sessions whose events name no
+// harness id all carry '' in the projection, so treating '' as a lookup key
+// would report thousands of unrelated transcripts as a match and suppress a
+// real import (the partial index deliberately excludes them too).
+//
+// Newest activity first, so a caller that wants one row gets the live one.
+func (s *Store) SessionsHoldingHarnessSessionID(harnessSessionID string) ([]HeldSession, error) {
+	if harnessSessionID == "" {
+		return nil, fmt.Errorf("SessionsHoldingHarnessSessionID: harness_session_id is required")
+	}
+	rows, err := s.reader.Query(
+		`SELECT s.session_id,
+		        (SELECT COUNT(*) FROM events e WHERE e.session_id = s.session_id),
+		        s.last_active
+		 FROM sessions s
+		 WHERE s.harness_session_id = ?
+		 ORDER BY s.last_active DESC`,
+		harnessSessionID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var held []HeldSession
+	for rows.Next() {
+		var h HeldSession
+		if err := rows.Scan(&h.SessionID, &h.EventCount, &h.LastActive); err != nil {
+			return nil, err
+		}
+		held = append(held, h)
+	}
+	return held, rows.Err()
+}
+
 // SessionAggregateRow is one session's summed totals as returned by
 // ListSessionAggregates. JSON marshalling lives on msg.SessionAggregate;
 // the handler converts row → response struct.

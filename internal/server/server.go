@@ -32,6 +32,11 @@ func New(s *store.Store, forwarder *ls.Forwarder) *Server {
 	srv.mux.HandleFunc("GET /api/v1/sessions/bundle", srv.handleBundle)
 	srv.mux.HandleFunc("GET /api/v1/sessions/{id}/events", srv.handleEvents)
 	srv.mux.HandleFunc("GET /api/v1/sessions/{id}/turn-state", srv.handleTurnState)
+	// Deliberately a sibling of search/aggregates/validators/bundle rather
+	// than /sessions/by-harness-id/{id}: a five-segment pattern with a
+	// literal in the fourth position overlaps /sessions/{id}/messages, and
+	// Go's ServeMux PANICS at registration on an ambiguous pair.
+	srv.mux.HandleFunc("GET /api/v1/sessions/by-harness-id", srv.handleSessionsByHarnessID)
 	srv.mux.HandleFunc("GET /health", srv.handleHealth)
 	return srv
 }
@@ -309,6 +314,37 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		hits = []store.SearchHit{}
 	}
 	writeJSON(w, hits)
+}
+
+// handleSessionsByHarnessID answers whether log-store already holds a
+// transcript for a harness-native session id, and under which of its own
+// session ids.
+//
+// It exists for llm-bridge-server's discovery import, which today asks its
+// own database whether a session is new and writes the answer's consequence
+// here. A caller can now put the question to the store that owns the write.
+//
+// A missing or empty harness_session_id is a 400, not an empty list: '' is
+// what every session whose events name no harness id carries, so answering
+// it would be answering a different question.
+func (s *Server) handleSessionsByHarnessID(w http.ResponseWriter, r *http.Request) {
+	harnessSessionID := r.URL.Query().Get("harness_session_id")
+	if harnessSessionID == "" {
+		http.Error(w, `{"error":"harness_session_id is required"}`, http.StatusBadRequest)
+		return
+	}
+	held, err := s.store.SessionsHoldingHarnessSessionID(harnessSessionID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if held == nil {
+		held = []store.HeldSession{}
+	}
+	writeJSON(w, map[string]any{
+		"harness_session_id": harnessSessionID,
+		"sessions":           held,
+	})
 }
 
 // handleAggregates returns per-session token/cost totals summed from the

@@ -692,3 +692,89 @@ func TestHarnessSessionIDBackfilledOnReopen(t *testing.T) {
 		t.Errorf("harness id = %q after reopen, want cc-uuid-old — the backfill did not run", hits[0].HarnessSessionID)
 	}
 }
+
+// The dedupe key an importer needs. Discovery decides a transcript is new by
+// asking its own database and writes the answer into log-store; the check has
+// to be answerable by the store that holds the write, and the harness id is
+// the only id both services agree on.
+func TestSessionsHoldingHarnessSessionID(t *testing.T) {
+	s := newTestStore(t)
+	s.StoreEvent("br_first", "user_message", harnessEvent("cc-uuid-held", "one"))
+	s.StoreEvent("br_first", "assistant", harnessEvent("cc-uuid-held", "two"))
+	// The same harness session imported a second time under a fresh bridge
+	// id — 103 harness sessions on the live host carry more than one.
+	s.StoreEvent("br_duplicate", "user_message", harnessEvent("cc-uuid-held", "one"))
+	// An unrelated session, and one whose events name no harness id.
+	s.StoreEvent("br_other", "user_message", harnessEvent("cc-uuid-other", "x"))
+	s.StoreEvent("br_anonymous", "user_message", []byte(`{"text":"y"}`))
+
+	held, err := s.SessionsHoldingHarnessSessionID("cc-uuid-held")
+	if err != nil {
+		t.Fatalf("SessionsHoldingHarnessSessionID: %v", err)
+	}
+	if len(held) != 2 {
+		t.Fatalf("got %d held sessions, want 2: %+v", len(held), held)
+	}
+	counts := map[string]int{}
+	for _, h := range held {
+		counts[h.SessionID] = h.EventCount
+	}
+	if counts["br_first"] != 2 {
+		t.Errorf("br_first event_count = %d, want 2", counts["br_first"])
+	}
+	if counts["br_duplicate"] != 1 {
+		t.Errorf("br_duplicate event_count = %d, want 1", counts["br_duplicate"])
+	}
+
+	unknown, err := s.SessionsHoldingHarnessSessionID("cc-uuid-never-seen")
+	if err != nil {
+		t.Fatalf("SessionsHoldingHarnessSessionID unknown: %v", err)
+	}
+	if len(unknown) != 0 {
+		t.Errorf("unknown harness id returned %d sessions, want 0: %+v", len(unknown), unknown)
+	}
+}
+
+// '' is a stored value, not a wildcard: every session whose events name no
+// harness id carries it. Answering a lookup for '' would report unrelated
+// transcripts as a match and talk an importer out of a real import.
+func TestSessionsHoldingHarnessSessionIDRefusesEmpty(t *testing.T) {
+	s := newTestStore(t)
+	s.StoreEvent("br_anonymous_a", "user_message", []byte(`{"text":"a"}`))
+	s.StoreEvent("br_anonymous_b", "user_message", []byte(`{"text":"b"}`))
+
+	held, err := s.SessionsHoldingHarnessSessionID("")
+	if err == nil {
+		t.Fatalf("empty harness id returned %d sessions and no error, want an error", len(held))
+	}
+	if held != nil {
+		t.Errorf("empty harness id returned %+v alongside its error, want nil", held)
+	}
+}
+
+// A resumed Claude Code session reports a new harness uuid partway through its
+// stream and the projection rolls forward to the latest one. The lookup has to
+// agree with that, or an importer asks about the id it holds and is told no.
+func TestSessionsHoldingHarnessSessionIDFollowsTheLatestID(t *testing.T) {
+	s := newTestStore(t)
+	s.StoreEvent("br_resumed", "user_message", harnessEvent("cc-uuid-before", "one"))
+	s.StoreEvent("br_resumed", "user_message", harnessEvent("cc-uuid-after", "two"))
+
+	after, err := s.SessionsHoldingHarnessSessionID("cc-uuid-after")
+	if err != nil {
+		t.Fatalf("SessionsHoldingHarnessSessionID: %v", err)
+	}
+	if len(after) != 1 || after[0].SessionID != "br_resumed" {
+		t.Fatalf("latest id resolved to %+v, want br_resumed", after)
+	}
+	if after[0].EventCount != 2 {
+		t.Errorf("event_count = %d, want 2 — the count is the whole session, not the events naming that id", after[0].EventCount)
+	}
+	before, err := s.SessionsHoldingHarnessSessionID("cc-uuid-before")
+	if err != nil {
+		t.Fatalf("SessionsHoldingHarnessSessionID: %v", err)
+	}
+	if len(before) != 0 {
+		t.Errorf("superseded id resolved to %+v, want nothing — the projection holds the latest", before)
+	}
+}
