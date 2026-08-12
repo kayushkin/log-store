@@ -350,6 +350,24 @@ func TestBuildTurnModel_CarriesSubagentFields(t *testing.T) {
 	if m.Entries["e_1"].HarnessParentID != "" {
 		t.Error("the parent's own narration must not be labelled as a subagent's work")
 	}
+
+	// A task event is a SYSTEM event, and the settled page has to say so. It
+	// used to answer kind "meta" for every subtype outside the visible list,
+	// while the live reducer answered "system" for all of them. Anything asking
+	// "is this a system event?" — the timeline, looking for a task's spawn and
+	// finish — therefore found task rows on a live stream and none at all after
+	// a reload.
+	for _, id := range []string{"e_1", "e_2"} {
+		if got := m.Entries[id].Kind; got != "system" {
+			t.Errorf("%s kind = %q, want system; the live reducer says system for the same event", id, got)
+		}
+	}
+	// Kind is not the visibility switch. These stay out of the COLLAPSED turns
+	// view, which reads duplicate, so calling them system costs that view
+	// nothing.
+	if !m.Entries["e_1"].Duplicate {
+		t.Error("a task event must stay out of the collapsed conversation view")
+	}
 }
 
 // Turns group by bridge TurnID; entryIds preserve eventId order.

@@ -213,14 +213,23 @@ func classify(ev *msg.Event) (role, kind string, conversation bool) {
 	case msg.EventError:
 		return "assistant", "error", true
 	case msg.EventSystem:
-		// A compact boundary and known progress subtypes (e.g. subagent_completed)
-		// are real conversation markers, surfaced on the settled path exactly as the
-		// live tail shows them — visible, kind "system", carrying the subtype. Other
-		// system events are bookkeeping. A known progress subtype is never an error.
-		if ev.System != nil && isVisibleSystemSubtype(ev.System.Subtype) {
-			return "system", "system", true
-		}
-		return "system", "meta", false
+		// A system event's KIND is "system". Whether it belongs in the COLLAPSED
+		// Turns view is a different question, answered by `conversation` below —
+		// a compact boundary and known progress subtypes are real conversation
+		// markers, the rest is bookkeeping.
+		//
+		// Those two used to be spelled as one: every subtype outside the visible
+		// list was relabelled kind "meta", so anything asking "is this a system
+		// event?" was told no. The live reducer says "system" for all of them
+		// (kindOf in chat-core reduce/TurnReducer.ts), so the two paths disagreed
+		// about the same event, and this file claims to mirror that one exactly.
+		//
+		// What it cost: the timeline finds a task's spawn and finish by asking
+		// for kind "system" with a task_* subtype. Live, it found them. On a
+		// reload it found nothing, because the settled page called every task
+		// event "meta" — so task rows appeared while a session streamed and
+		// vanished the moment the page was refreshed.
+		return "system", "system", ev.System != nil && isVisibleSystemSubtype(ev.System.Subtype)
 	case msg.EventStream, msg.EventBlock:
 		// Streaming partials / per-block echoes are superseded by the message's
 		// result in the collapsed view, but retained for the raw Timeline.
