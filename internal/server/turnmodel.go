@@ -50,6 +50,26 @@ type Entry struct {
 	StatusCode int    `json:"statusCode,omitempty"` // ErrorEvent.StatusCode
 	Subtype    string `json:"subtype,omitempty"`    // SystemEvent.Subtype (subagent_completed, …)
 
+	// The subagent fields of msg.SystemEvent, for `task_*` subtypes. Subtype
+	// alone used to be the only one carried, so a settled page said a task
+	// existed and nothing else: not which task, not whether it finished, not
+	// what it reported. Anything reading history rather than the live stream saw
+	// every subagent as permanently in flight.
+	ToolUseID         string `json:"toolUseId,omitempty"`
+	TaskID            string `json:"taskId,omitempty"`
+	TaskStatus        string `json:"taskStatus,omitempty"`
+	TaskSummary       string `json:"taskSummary,omitempty"`
+	TaskOutputFile    string `json:"taskOutputFile,omitempty"`
+	TaskType          string `json:"taskType,omitempty"`
+	SubagentType      string `json:"subagentType,omitempty"`
+	SubagentSessionID string `json:"subagentSessionId,omitempty"`
+	LastToolName      string `json:"lastToolName,omitempty"`
+
+	// HarnessParentID says this entry is a subagent's own work rather than this
+	// session's — Event.HarnessParentID, present on any event type. A view of
+	// what THIS session did must leave those out.
+	HarnessParentID string `json:"harnessParentId,omitempty"`
+
 	Duplicate bool   `json:"duplicate"`
 	Primary   bool   `json:"primary"`
 	GroupID   string `json:"groupId,omitempty"`
@@ -300,7 +320,17 @@ func buildTurnModel(sessionID string, rows []store.EventRow, more bool) TurnMode
 		}
 		if ev.Type == msg.EventSystem && ev.System != nil {
 			e.Subtype = ev.System.Subtype
+			e.ToolUseID = ev.System.ToolUseID
+			e.TaskID = ev.System.TaskID
+			e.TaskStatus = ev.System.TaskStatus
+			e.TaskSummary = ev.System.TaskSummary
+			e.TaskOutputFile = ev.System.TaskOutputFile
+			e.TaskType = ev.System.TaskType
+			e.SubagentType = ev.System.SubagentType
+			e.SubagentSessionID = ev.System.SubagentSessionID
+			e.LastToolName = ev.System.LastToolName
 		}
+		e.HarnessParentID = ev.HarnessParentID
 		if isRecovered(&ev) {
 			e.Recovered = true
 		}

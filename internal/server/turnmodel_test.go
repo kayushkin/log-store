@@ -298,6 +298,60 @@ func TestBuildTurnModel_SubagentCompleted_Visible(t *testing.T) {
 	}
 }
 
+// TestBuildTurnModel_CarriesSubagentFields is the regression for a settled page
+// that knew a task existed and nothing else. Subtype was the only SystemEvent
+// field materialized, so on reload every subagent looked permanently in flight:
+// no id to name it, no status to close it, no summary to report, and no session
+// to follow. The live stream carried all of it; only history threw it away.
+func TestBuildTurnModel_CarriesSubagentFields(t *testing.T) {
+	base := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	rows := []store.EventRow{
+		mkRow(t, 1, msg.Event{Type: msg.EventSystem, TurnID: "t", Timestamp: base,
+			System: &msg.SystemEvent{
+				Subtype: "task_started", TaskID: "a1", ToolUseID: "toolu_1",
+				TaskType: msg.TaskTypeLocalAgent, SubagentType: "Explore",
+				SubagentSessionID: "br_sub", Description: "probe",
+			}}),
+		mkRow(t, 2, msg.Event{Type: msg.EventSystem, TurnID: "t", Timestamp: base.Add(time.Second),
+			System: &msg.SystemEvent{
+				Subtype: "task_notification", TaskID: "a1", TaskStatus: msg.TaskStatusCompleted,
+				TaskSummary: "found it", SubagentSessionID: "br_sub",
+			}}),
+		// A subagent's own frame, kept on the parent by the server's fail-safe.
+		// It must arrive labelled as somebody else's work.
+		mkRow(t, 3, msg.Event{Type: msg.EventBlock, TurnID: "t", Timestamp: base.Add(2 * time.Second),
+			HarnessParentID: "toolu_1",
+			Block:           &msg.BlockEvent{Block: &msg.ContentBlock{Type: msg.BlockText, Text: &msg.TextBlock{Text: "subagent working"}}}}),
+	}
+	m := buildTurnModel("s", rows, false)
+
+	started := m.Entries["e_1"]
+	if started.TaskID != "a1" || started.ToolUseID != "toolu_1" {
+		t.Errorf("task correlators lost: %+v", started)
+	}
+	if started.TaskType != msg.TaskTypeLocalAgent || started.SubagentType != "Explore" {
+		t.Errorf("task kind lost: taskType=%q subagentType=%q", started.TaskType, started.SubagentType)
+	}
+	if started.SubagentSessionID != "br_sub" {
+		t.Errorf("subagentSessionId = %q, want br_sub — without it a reloaded page has nothing to link to", started.SubagentSessionID)
+	}
+
+	done := m.Entries["e_2"]
+	if done.TaskStatus != msg.TaskStatusCompleted {
+		t.Errorf("taskStatus = %q, want completed — the only thing that ever says a subagent finished", done.TaskStatus)
+	}
+	if done.TaskSummary != "found it" {
+		t.Errorf("taskSummary = %q, want %q", done.TaskSummary, "found it")
+	}
+
+	if got := m.Entries["e_3"].HarnessParentID; got != "toolu_1" {
+		t.Errorf("harnessParentId = %q, want toolu_1 — a subagent's own row must say so", got)
+	}
+	if m.Entries["e_1"].HarnessParentID != "" {
+		t.Error("the parent's own narration must not be labelled as a subagent's work")
+	}
+}
+
 // Turns group by bridge TurnID; entryIds preserve eventId order.
 func TestBuildTurnModel_TurnGrouping(t *testing.T) {
 	base := time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC)
