@@ -265,6 +265,15 @@ func buildTurnModel(sessionID string, rows []store.EventRow, more bool) TurnMode
 	harnessByKey := map[dedupKey][]string{}
 	otelByKey := map[dedupKey][]string{}
 
+	// Entry ids of block echoes whose payload is a real TEXT block. Both a text
+	// and a thinking block classify to kind "text" (messageText falls through to
+	// Thinking.Text), and on this host thinking blocks are the MAJORITY of stored
+	// blocks — 82,997 against 55,538. Only the text ones are prose, so only they
+	// are candidates for the promotion below. The distinction exists solely at
+	// materialization time, which is why it is collected here rather than derived
+	// from the Entry.
+	textBlockIDs := map[string]bool{}
+
 	var maxEventID int64
 
 	// Aggregate accumulators (Phase 2). Computed from the events actually read
@@ -338,6 +347,9 @@ func buildTurnModel(sessionID string, rows []store.EventRow, more bool) TurnMode
 			e.SubagentType = ev.System.SubagentType
 			e.SubagentSessionID = ev.System.SubagentSessionID
 			e.LastToolName = ev.System.LastToolName
+		}
+		if ev.Type == msg.EventBlock && ev.Block != nil && ev.Block.Block != nil && ev.Block.Block.Text != nil {
+			textBlockIDs[id] = true
 		}
 		e.HarnessParentID = ev.HarnessParentID
 		if isRecovered(&ev) {
@@ -436,6 +448,13 @@ func buildTurnModel(sessionID string, rows []store.EventRow, more bool) TurnMode
 	// is buffered and dropped upstream), so their streamed blocks stay hidden — no
 	// regression. The recovered flag is preserved either way.
 	surfaceRecoveredBlocks(turns, entries)
+
+	// Keep a turn's own block text visible when no result ever supersedes it. A
+	// subagent emits no result event of its own — that is the premise of the
+	// subagent-settling design — so its blocks were marked superseded by a message
+	// that never arrives, and every collapsed surface rendered the session empty.
+	// Runs after A1 so the two passes cannot both promote in one turn.
+	surfaceUnsupersededBlocks(turns, entries, textBlockIDs)
 
 	// Validator is derived from the events actually present. maxEventID is the
 	// high-water row id in this page; the count endpoint (/validators) reports
@@ -568,6 +587,76 @@ func buildTurns(order []string, entries map[string]Entry) []Turn {
 		}
 	}
 	return turns
+}
+
+// supersedesBlocks reports whether an entry is an authoritative assistant message
+// that supersedes the plain block echoes in its turn: a result carrying text. Every
+// healthy turn ends in one, which is why hiding blocks is right almost everywhere.
+//
+// A result with no text supersedes nothing a reader can see, so it does not count —
+// the same bar supersedesRecovered already applies.
+//
+// It does NOT also treat an already-visible assistant text atom as authoritative,
+// though that was the first thing written here. Such an atom could only be a
+// recovered/OTel block A1 promoted a moment earlier, and A1 promotes only when
+// nothing supersedes ITS candidate — where "supersedes" means a harness,
+// non-recovered assistant text with text, which is precisely this pass's candidate
+// set. So a turn can never hold both, the clause could not fire, and a mutation
+// deleting it survived the suite. An unreachable guard that no test can pin is worse
+// than no guard: it reads as protection. The two passes are kept from colliding by
+// disjoint candidate sets instead, which is a property the tests can see.
+func supersedesBlocks(e Entry) bool {
+	if e.Text == "" || e.Role != "assistant" {
+		return false
+	}
+	return e.Kind == "result"
+}
+
+// surfaceUnsupersededBlocks promotes a turn's harness text blocks to visible primary
+// atoms when nothing in that turn supersedes them. Mutates `entries` in place;
+// non-destructive, like every other pass here — it flips duplicate/primary annotation
+// and drops nothing.
+//
+// Blocks are hidden by default because a healthy turn's result repeats their text.
+// That default was applied unconditionally, and a subagent session has no result to
+// repeat anything: its blocks were the only record of what was said and were marked
+// superseded regardless, so the collapsed view had nothing left to render. 1,445
+// subagent sessions on this host rendered blank in every surface that uses it.
+//
+// Two things are deliberately out of scope, both measured over this host's 26,038
+// stored (session, turn) groups:
+//
+//   - Stream deltas. A delta is a FRAGMENT of a message, so promoting one would put a
+//     bubble per chunk in the collapsed view. 1,817 groups have a block and no result,
+//     93 have a stream and no result, and none have both — so leaving streams alone
+//     costs the block population nothing.
+//   - Thinking blocks. They classify to kind "text" as well (see textBlockIDs), and
+//     they are reasoning rather than prose.
+func surfaceUnsupersededBlocks(turns []Turn, entries map[string]Entry, textBlockIDs map[string]bool) {
+	for _, turn := range turns {
+		superseded := false
+		var candidates []string
+		for _, eid := range turn.EntryIDs {
+			e := entries[eid]
+			// A recovered/OTel block is A1's candidate, never this pass's.
+			if textBlockIDs[eid] && e.Text != "" && !isRecoveredOrOTelAssistantText(e) {
+				candidates = append(candidates, eid)
+				continue
+			}
+			if supersedesBlocks(e) {
+				superseded = true
+			}
+		}
+		if superseded {
+			continue
+		}
+		for _, eid := range candidates {
+			e := entries[eid]
+			e.Primary = true
+			e.Duplicate = false
+			entries[eid] = e
+		}
+	}
 }
 
 // isRecoveredOrOTelAssistantText reports whether an entry is a recovered/OTel-sourced
