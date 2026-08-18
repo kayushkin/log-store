@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	neturl "net/url"
 	"time"
 
 	"github.com/kayushkin/llm-bridge/msg"
@@ -104,6 +105,52 @@ func (c *Client) ListEvents(sessionID string, afterID int64, types []string) ([]
 		return nil, fmt.Errorf("decode events: %w", err)
 	}
 	return out, nil
+}
+
+// HeldSession mirrors store.HeldSession — one log-store session that already
+// holds a transcript for the harness session id that was asked about.
+type HeldSession struct {
+	SessionID  string `json:"session_id"`
+	EventCount int    `json:"event_count"`
+	LastActive string `json:"last_active"`
+}
+
+// SessionsHoldingHarnessSessionID asks log-store whether it already holds a
+// transcript for a harness-native session id, and returns every log-store
+// session that does, newest activity first.
+//
+// This is the dedupe key for an import. Asking the local database instead is
+// what let a throwaway gateway with a temporary database re-import 2,863
+// transcripts into the production store: the check lived in a database the
+// store could not see.
+//
+// An empty id is refused here rather than sent, because '' is a real stored
+// value (every session whose events name no harness id) and would match
+// thousands of unrelated rows.
+func (c *Client) SessionsHoldingHarnessSessionID(harnessSessionID string) ([]HeldSession, error) {
+	if harnessSessionID == "" {
+		return nil, fmt.Errorf("SessionsHoldingHarnessSessionID: harness_session_id is required")
+	}
+	url := fmt.Sprintf(
+		"%s/api/v1/sessions/by-harness-id?harness_session_id=%s",
+		c.baseURL, neturl.QueryEscape(harnessSessionID),
+	)
+	resp, err := c.httpClient.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("get sessions by harness id: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("log-store error: %s - %s", resp.Status, string(body))
+	}
+	var out struct {
+		Sessions []HeldSession `json:"sessions"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("decode sessions by harness id: %w", err)
+	}
+	return out.Sessions, nil
 }
 
 func joinTypes(types []string) string {

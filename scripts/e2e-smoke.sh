@@ -304,6 +304,38 @@ eq "aggregate cost_usd"      "$(jq -r '.cost_usd' <<<"$ROW")" "0.25"
 eq "aggregate duration_ms"   "$(jq -r '.duration_ms' <<<"$ROW")" "777"
 eq "aggregate model"         "$(jq -r '.model' <<<"$ROW")" "$MODEL"
 
+step "GET /api/v1/sessions/by-harness-id — the import dedupe key"
+# llm-bridge-server's discovery asks THIS endpoint whether a transcript is
+# already durable before importing it. It used to ask its own database, which
+# is how a throwaway gateway with a temp DB pushed 2,863 duplicate sessions
+# into the production store on 2026-08-01. The id is the harness-native one:
+# discovery mints a fresh bridge id on every import, so bridge ids cannot
+# answer the question.
+HSID="e2e-smoke-harness-$$-$RANDOM"
+DEDUPE_A="$SID-dedupe-a"
+DEDUPE_B="$SID-dedupe-b"
+for BR in "$DEDUPE_A" "$DEDUPE_B"; do
+  post_event "$(jq -nc --arg sid "$BR" --arg hsid "$HSID" --arg ts "$NOW" '{
+    type:"user_message", harness:"mock", bridge_session_id:$sid,
+    harness_session_id:$hsid, timestamp:$ts, result:{text:"dedupe fixture"}
+  }')" >/dev/null
+done
+HELD=$(get "/api/v1/sessions/by-harness-id?harness_session_id=$HSID")
+eq "echoed harness_session_id" "$(jq -r '.harness_session_id' <<<"$HELD")" "$HSID"
+eq "both imports reported"     "$(jq -r '.sessions | length' <<<"$HELD")" "2"
+eq "event_count per session"   "$(jq -r '[.sessions[].event_count] | unique | join(",")' <<<"$HELD")" "1"
+eq "session ids reported"      "$(jq -r '[.sessions[].session_id] | sort | join(",")' <<<"$HELD")" \
+                               "$(printf '%s\n%s\n' "$DEDUPE_A" "$DEDUPE_B" | sort | paste -sd,)"
+eq "unknown harness id → empty list" \
+   "$(jq -r '.sessions | length' <<<"$(get "/api/v1/sessions/by-harness-id?harness_session_id=$HSID-absent")")" "0"
+# '' is a real stored value — every session whose events name no harness id
+# carries it, including $SID above. Answering it would report unrelated
+# transcripts as a match and talk an importer out of a real import.
+eq "missing harness_session_id → 400" \
+   "$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' "$BASE/api/v1/sessions/by-harness-id")" "400"
+eq "empty harness_session_id → 400" \
+   "$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' "$BASE/api/v1/sessions/by-harness-id?harness_session_id=")" "400"
+
 step "POST /api/v1/events — malformed input is rejected, not stored"
 eq "missing bridge_session_id → 400" "$(status_of '{"type":"result","result":{"text":"orphan"}}')" "400"
 eq "invalid JSON → 400"              "$(status_of 'not json at all')" "400"
@@ -321,8 +353,11 @@ eq "assistant text survives"  "$(jq -r '.[1].content' <<<"$(get "/api/v1/session
 ROW=$(jq -c --arg sid "$SID" '.[] | select(.session_id==$sid)' <<<"$(get /api/v1/sessions/aggregates)")
 eq "turns not double-counted by backfill" "$(jq -r '.turns' <<<"$ROW")" "1"
 eq "input_tokens not double-counted"      "$(jq -r '.input_tokens' <<<"$ROW")" "1234"
+eq "harness-id lookup survives restart" \
+   "$(jq -r '.sessions | length' <<<"$(get "/api/v1/sessions/by-harness-id?harness_session_id=$HSID")")" "2"
 
 step "SUCCESS — log-store boots, ingests, materializes, and persists"
 echo "    routes exercised: POST /api/v1/events; GET /health,"
 echo "      /api/v1/sessions/{id}/{messages,history,events,turn-state},"
-echo "      /api/v1/sessions/search, /api/v1/sessions/aggregates"
+echo "      /api/v1/sessions/search, /api/v1/sessions/aggregates,"
+echo "      /api/v1/sessions/by-harness-id"

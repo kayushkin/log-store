@@ -11,8 +11,33 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// readerPoolSize bounds how many queries run at once. Reads here are not
+// small — one /messages call over the largest real session scans 13,776 rows
+// and serialises 306MB — so an unbounded pool would let a handful of clients
+// pin every core. Eight is well above the number of dashboards this serves
+// and still leaves the machine room to run the harnesses that feed it.
+const readerPoolSize = 8
+
 type Store struct {
-	db *sql.DB
+	// writer runs every INSERT and UPDATE through a single connection.
+	// modernc.org/sqlite treats each pooled connection as an independent
+	// writer, so more than one still hits SQLITE_BUSY (5) under concurrent
+	// ingest and silently drops events when the caller swallows the 500.
+	writer *sql.DB
+
+	// reader runs every SELECT on its own pool. Under WAL a reader never
+	// blocks the writer, so a query can no longer stall event ingest for
+	// every live session. Measured on the live 1.9GB database: draining the
+	// largest session's events holds its connection for 573ms, and while
+	// reads and writes shared this one connection that was 573ms in which
+	// no session anywhere could log an event. Opened query_only so a write
+	// routed here fails loudly instead of quietly competing for the lock.
+	//
+	// Honest about the size of the win: an end-to-end A/B (sustained reads
+	// against old and new binaries on a copy of the live database) could
+	// not separate them — the effect sits inside the noise of a busy box.
+	// This is a correctness change, not a measured speedup.
+	reader *sql.DB
 }
 
 func New(dbPath string) (*Store, error) {
@@ -20,33 +45,50 @@ func New(dbPath string) (*Store, error) {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, fmt.Errorf("create db dir: %w", err)
 	}
-	d, err := sql.Open("sqlite", dbPath)
+	writer, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := d.Exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;"); err != nil {
-		d.Close()
+	// journal_mode is a property of the database file, so this one Exec sets
+	// WAL for the reader pool too. busy_timeout is per-connection and the
+	// reader carries its own in the DSN below.
+	if _, err := writer.Exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;"); err != nil {
+		writer.Close()
 		return nil, fmt.Errorf("sqlite pragmas: %w", err)
 	}
+	writer.SetMaxOpenConns(1)
 
-	// Single connection serializes writes through Go's sql pool. Without this,
-	// modernc.org/sqlite still hits SQLITE_BUSY (5) under concurrent writers,
-	// silently dropping events (e.g. user_message via PushEvent) when the
-	// caller swallows the 500.
-	d.SetMaxOpenConns(1)
+	// modernc applies _pragma= to every connection it opens, which a one-shot
+	// Exec on a pool cannot do — query_only and busy_timeout are both
+	// per-connection. Verified by behaviour, not by reading the pragma back:
+	// TestAWriteThroughTheReaderPoolIsRefused drives 40 concurrent writes
+	// through this handle and every one must fail.
+	reader, err := sql.Open("sqlite", dbPath+"?_pragma=query_only(1)&_pragma=busy_timeout(5000)")
+	if err != nil {
+		writer.Close()
+		return nil, err
+	}
+	reader.SetMaxOpenConns(readerPoolSize)
 
-	s := &Store{db: d}
+	s := &Store{writer: writer, reader: reader}
 	if err := s.migrate(); err != nil {
-		d.Close()
+		writer.Close()
+		reader.Close()
 		return nil, err
 	}
 	return s, nil
 }
 
-func (s *Store) Close() error { return s.db.Close() }
+func (s *Store) Close() error {
+	rerr := s.reader.Close()
+	if err := s.writer.Close(); err != nil {
+		return err
+	}
+	return rerr
+}
 
 func (s *Store) migrate() error {
-	if _, err := s.db.Exec(`
+	if _, err := s.writer.Exec(`
 		CREATE TABLE IF NOT EXISTS events (
 			id         INTEGER PRIMARY KEY AUTOINCREMENT,
 			session_id TEXT NOT NULL,
@@ -63,7 +105,7 @@ func (s *Store) migrate() error {
 	// totals derived from the events table. Maintained synchronously by
 	// StoreEvent so reads are O(1) instead of O(events). Always rebuildable
 	// from events; backfilled below if rows are missing.
-	if _, err := s.db.Exec(`
+	if _, err := s.writer.Exec(`
 		CREATE TABLE IF NOT EXISTS sessions (
 			session_id    TEXT PRIMARY KEY,
 			turn_count    INTEGER NOT NULL DEFAULT 0,
@@ -80,9 +122,12 @@ func (s *Store) migrate() error {
 	`); err != nil {
 		return err
 	}
+	if err := s.migrateHarnessSessionID(); err != nil {
+		return err
+	}
 	// Backfill from events for any session not already projected. Runs once
 	// per session — guarded by NOT IN to skip already-populated sessions.
-	if _, err := s.db.Exec(`
+	if _, err := s.writer.Exec(`
 		INSERT INTO sessions (
 			session_id, turn_count, input_tokens, output_tokens,
 			cost_usd, duration_ms, model, started_at, last_active, ended_at
@@ -117,13 +162,75 @@ func (s *Store) migrate() error {
 	return nil
 }
 
+// migrateHarnessSessionID adds the sessions projection's harness_session_id
+// column and backfills it from the events that already carry the id.
+//
+// Why the column exists at all: log-store keys everything on one opaque
+// session_id — whatever the writer handed it. In practice that is sometimes
+// llm-bridge-server's bridge_id and sometimes the harness-native id, and a
+// third of this host's rows carry a bridge_id the gateway has since deleted
+// as a phantom. A consumer that takes a search hit's session_id straight to
+// the gateway's GET /sessions/{id} therefore gets a 404 for a session that
+// very much exists — measured on this host at 4,083 of 11,640 sessions
+// (35%), against only 4 that are genuinely unrecoverable.
+//
+// Every one of those events already names its harness_session_id, and the
+// gateway keys a unique index on that same column. Publishing the id
+// log-store already stores is what makes a hit resolvable, and it needs no
+// knowledge of the gateway's session set — so it adds no coupling between
+// the two services. log-store still does not resolve anything itself; it
+// reports both ids and lets the consumer join.
+//
+// The backfill is deliberately tied to the ALTER: `ADD COLUMN` fails once
+// the column exists, and that error is the signal that the one-shot import
+// has already run. The alternative — guarding on the column still being
+// empty — would re-scan every event of every session that legitimately has
+// no harness id on every single boot, forever. Both statements share one
+// transaction so a failed backfill rolls the column back and retries on the
+// next boot rather than leaving the table half-migrated.
+func (s *Store) migrateHarnessSessionID() error {
+	tx, err := s.writer.Begin()
+	if err != nil {
+		return fmt.Errorf("begin harness_session_id migration: %w", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`ALTER TABLE sessions ADD COLUMN harness_session_id TEXT NOT NULL DEFAULT ''`); err != nil {
+		// Column already present: the backfill ran on an earlier boot.
+		return nil
+	}
+	// Latest wins, not first. A resumed or forked Claude Code session reports
+	// a new harness uuid partway through its event stream, and the gateway's
+	// sessions row holds the current one — 11 sessions on this host have more
+	// than one. Taking MAX(id) is what keeps the two stores agreeing.
+	if _, err := tx.Exec(`
+		UPDATE sessions SET harness_session_id = COALESCE((
+			SELECT json_extract(e.data, '$.harness_session_id')
+			FROM events e
+			WHERE e.session_id = sessions.session_id
+			  AND json_extract(e.data, '$.harness_session_id') IS NOT NULL
+			  AND json_extract(e.data, '$.harness_session_id') != ''
+			ORDER BY e.id DESC LIMIT 1
+		), '')
+	`); err != nil {
+		return fmt.Errorf("backfill harness_session_id: %w", err)
+	}
+	if _, err := tx.Exec(
+		`CREATE INDEX IF NOT EXISTS idx_sessions_harness_session_id
+		 ON sessions(harness_session_id) WHERE harness_session_id != ''`,
+	); err != nil {
+		return fmt.Errorf("index harness_session_id: %w", err)
+	}
+	return tx.Commit()
+}
+
 // StoreEvent persists a raw event and updates the per-session projection.
 // The projection is a derived cache; failure to update is logged but does
 // not fail the underlying event insert (the event is still queryable; the
 // next StoreEvent call rolls forward correctly, and on next boot migrate()
 // will not re-backfill an already-present row).
 func (s *Store) StoreEvent(sessionID, eventType string, data []byte) (int64, error) {
-	result, err := s.db.Exec(
+	result, err := s.writer.Exec(
 		`INSERT INTO events (session_id, type, data) VALUES (?,?,?)`,
 		sessionID, eventType, string(data),
 	)
@@ -145,22 +252,37 @@ func (s *Store) updateSessionProjection(sessionID, eventType string, data []byte
 	// Ensure the row exists. INSERT OR IGNORE is a no-op for established
 	// sessions; for the first event of a new session it seeds started_at /
 	// last_active to NOW().
-	if _, err := s.db.Exec(
+	if _, err := s.writer.Exec(
 		`INSERT OR IGNORE INTO sessions (session_id) VALUES (?)`,
 		sessionID,
 	); err != nil {
 		return fmt.Errorf("seed sessions row: %w", err)
 	}
 	// Bump last_active on every event regardless of type.
-	if _, err := s.db.Exec(
+	if _, err := s.writer.Exec(
 		`UPDATE sessions SET last_active = CURRENT_TIMESTAMP WHERE session_id = ?`,
 		sessionID,
 	); err != nil {
 		return fmt.Errorf("touch last_active: %w", err)
 	}
+	// Roll the harness-native id forward from whatever this event reports.
+	// It is written on every event type rather than on session start because
+	// log-store has no session-start event: the first frame of a session is
+	// just an ordinary event, and a resumed session reports a new harness
+	// uuid partway through. Last writer wins, matching the migration's
+	// MAX(id) backfill and the gateway's own row.
+	if harnessSessionID := harnessSessionIDOf(data); harnessSessionID != "" {
+		if _, err := s.writer.Exec(
+			`UPDATE sessions SET harness_session_id = ?
+			 WHERE session_id = ? AND harness_session_id != ?`,
+			harnessSessionID, sessionID, harnessSessionID,
+		); err != nil {
+			return fmt.Errorf("set harness_session_id: %w", err)
+		}
+	}
 	switch eventType {
 	case "user_message":
-		_, err := s.db.Exec(
+		_, err := s.writer.Exec(
 			`UPDATE sessions SET turn_count = turn_count + 1 WHERE session_id = ?`,
 			sessionID,
 		)
@@ -187,13 +309,13 @@ func (s *Store) updateSessionProjection(sessionID, eventType string, data []byte
 			log.Printf("[log-store] decode result event %s: %v", sessionID, err)
 			// Still set ended_at — the event terminated the turn even if
 			// the body was malformed.
-			_, err := s.db.Exec(
+			_, err := s.writer.Exec(
 				`UPDATE sessions SET ended_at = CURRENT_TIMESTAMP WHERE session_id = ?`,
 				sessionID,
 			)
 			return err
 		}
-		_, err := s.db.Exec(
+		_, err := s.writer.Exec(
 			`UPDATE sessions SET
 				input_tokens = input_tokens + ?,
 				output_tokens = output_tokens + ?,
@@ -211,7 +333,7 @@ func (s *Store) updateSessionProjection(sessionID, eventType string, data []byte
 		)
 		return err
 	case "error":
-		_, err := s.db.Exec(
+		_, err := s.writer.Exec(
 			`UPDATE sessions SET ended_at = CURRENT_TIMESTAMP WHERE session_id = ?`,
 			sessionID,
 		)
@@ -234,7 +356,7 @@ func (s *Store) ListEvents(sessionID string, types []string) ([]json.RawMessage,
 		}
 	}
 	q += ` ORDER BY id ASC`
-	rows, err := s.db.Query(q, args...)
+	rows, err := s.reader.Query(q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -263,7 +385,7 @@ func (s *Store) ListEventsSinceID(sessionID string, afterID int, types []string)
 		}
 	}
 	q += ` ORDER BY id ASC`
-	rows, err := s.db.Query(q, args...)
+	rows, err := s.reader.Query(q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -315,19 +437,56 @@ func injectEventID(data []byte, rowID int64) json.RawMessage {
 	return out
 }
 
+// harnessSessionIDOf reads the harness-native session id an event carries.
+// Returns "" for a malformed body or an event that names no harness id —
+// both are ordinary, so neither is an error: 1,675 of this host's 11,640
+// sessions have no harness id anywhere in their event stream.
+func harnessSessionIDOf(data []byte) string {
+	var ev struct {
+		HarnessSessionID string `json:"harness_session_id"`
+	}
+	if err := json.Unmarshal(data, &ev); err != nil {
+		return ""
+	}
+	return ev.HarnessSessionID
+}
+
 // SearchSessions returns session IDs with events whose raw data contains query.
 // Match count is the number of matching events per session.
+//
+// Each hit reports both ids it has. session_id is log-store's own key and is
+// whatever the writer handed it — for a third of this host's sessions that is
+// a bridge_id llm-bridge-server has since deleted as a phantom, so taking it
+// straight to GET /sessions/{id} yields a 404 for a live session.
+// harness_session_id is the harness-native id from the session's events, and
+// it is what the gateway keys its own unique index on. A consumer that 404s
+// on the first should retry on the second before calling a hit unrenderable.
 func (s *Store) SearchSessions(query string, limit int) ([]SearchHit, error) {
 	if limit <= 0 {
 		limit = 100
 	}
-	rows, err := s.db.Query(
-		`SELECT session_id, COUNT(*) AS n
-		 FROM events
-		 WHERE data LIKE '%' || ? || '%'
-		 GROUP BY session_id
-		 ORDER BY MAX(id) DESC
-		 LIMIT ?`,
+	// The join sits outside the LIMIT, not inside it. Joining in the same
+	// SELECT as the GROUP BY makes SQLite look up the projection once per
+	// matched group — 8,138 seeks for a whole-corpus query on this host, and
+	// measurably 1.1s of the 3.9s it then took. Feeding it the already-
+	// truncated result costs at most `limit` seeks instead, which brought the
+	// same query back to 2.86s against 2.74s before the column existed.
+	//
+	// LEFT JOIN, not JOIN: a session with events but no projection row must
+	// still appear as a hit with an empty harness id, exactly as it did
+	// before this column existed. An inner join would silently drop it.
+	rows, err := s.reader.Query(
+		`SELECT hit.session_id, hit.match_count, COALESCE(s.harness_session_id, '')
+		 FROM (
+			SELECT session_id, COUNT(*) AS match_count, MAX(id) AS last_event_id
+			FROM events
+			WHERE data LIKE '%' || ? || '%'
+			GROUP BY session_id
+			ORDER BY last_event_id DESC
+			LIMIT ?
+		 ) hit
+		 LEFT JOIN sessions s ON s.session_id = hit.session_id
+		 ORDER BY hit.last_event_id DESC`,
 		query, limit,
 	)
 	if err != nil {
@@ -337,7 +496,7 @@ func (s *Store) SearchSessions(query string, limit int) ([]SearchHit, error) {
 	var hits []SearchHit
 	for rows.Next() {
 		var h SearchHit
-		if err := rows.Scan(&h.SessionID, &h.MatchCount); err != nil {
+		if err := rows.Scan(&h.SessionID, &h.MatchCount, &h.HarnessSessionID); err != nil {
 			return nil, err
 		}
 		hits = append(hits, h)
@@ -349,6 +508,73 @@ func (s *Store) SearchSessions(query string, limit int) ([]SearchHit, error) {
 type SearchHit struct {
 	SessionID  string `json:"session_id"`
 	MatchCount int    `json:"match_count"`
+	// HarnessSessionID is the harness-native id (a Claude Code UUID, a Codex
+	// thread_id) taken from the session's own events. Empty when the events
+	// name none. It is the key that resolves a hit against llm-bridge-server
+	// when session_id does not.
+	HarnessSessionID string `json:"harness_session_id"`
+}
+
+// HeldSession names one log-store session that already holds a transcript,
+// as reported by SessionsHoldingHarnessSessionID.
+type HeldSession struct {
+	// SessionID is log-store's own key for the transcript — whatever the
+	// writer handed it. Usually an llm-bridge-server bridge id, and for a
+	// third of this host's rows a bridge id the gateway has since deleted.
+	SessionID string `json:"session_id"`
+	// EventCount is how many events this session holds. Counted from the
+	// events table rather than read off the projection, because the caller
+	// is asking whether a transcript is already durable and the projection
+	// counts turns, not events.
+	EventCount int `json:"event_count"`
+	// LastActive is the projection's last-activity stamp for the session.
+	LastActive string `json:"last_active"`
+}
+
+// SessionsHoldingHarnessSessionID answers "do you already hold this
+// harness session's transcript?" — the question llm-bridge-server's
+// discovery has to ask before importing one.
+//
+// Discovery decides a session is new by asking its OWN database, then writes
+// the answer's consequence into log-store. A gateway booted with a fresh
+// database and the default log-store URL therefore re-imports every
+// transcript on disk; that is how 2,863 duplicate sessions reached this
+// host's production log-store on 2026-08-01. The dedupe key has to live in
+// the store that holds the writes, and the only id both services agree on is
+// the harness-native one.
+//
+// An empty id is refused rather than answered. Sessions whose events name no
+// harness id all carry '' in the projection, so treating '' as a lookup key
+// would report thousands of unrelated transcripts as a match and suppress a
+// real import (the partial index deliberately excludes them too).
+//
+// Newest activity first, so a caller that wants one row gets the live one.
+func (s *Store) SessionsHoldingHarnessSessionID(harnessSessionID string) ([]HeldSession, error) {
+	if harnessSessionID == "" {
+		return nil, fmt.Errorf("SessionsHoldingHarnessSessionID: harness_session_id is required")
+	}
+	rows, err := s.reader.Query(
+		`SELECT s.session_id,
+		        (SELECT COUNT(*) FROM events e WHERE e.session_id = s.session_id),
+		        s.last_active
+		 FROM sessions s
+		 WHERE s.harness_session_id = ?
+		 ORDER BY s.last_active DESC`,
+		harnessSessionID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var held []HeldSession
+	for rows.Next() {
+		var h HeldSession
+		if err := rows.Scan(&h.SessionID, &h.EventCount, &h.LastActive); err != nil {
+			return nil, err
+		}
+		held = append(held, h)
+	}
+	return held, rows.Err()
 }
 
 // SessionAggregateRow is one session's summed totals as returned by
@@ -373,7 +599,7 @@ type SessionAggregateRow struct {
 // implementation accidentally counted result events as "turns"; the
 // projection's turn_count field is the corrected definition.
 func (s *Store) ListSessionAggregates() ([]SessionAggregateRow, error) {
-	rows, err := s.db.Query(`
+	rows, err := s.reader.Query(`
 		SELECT session_id, turn_count, input_tokens, output_tokens,
 		       cost_usd, duration_ms, model
 		FROM sessions
@@ -411,14 +637,14 @@ type TurnState struct {
 // session along with the derived in-flight flag.
 func (s *Store) TurnState(sessionID string) (TurnState, error) {
 	var ts TurnState
-	row := s.db.QueryRow(
+	row := s.reader.QueryRow(
 		`SELECT COALESCE(MAX(id), 0) FROM events WHERE session_id=? AND type='user_message'`,
 		sessionID,
 	)
 	if err := row.Scan(&ts.LastUserMessageEventID); err != nil {
 		return ts, err
 	}
-	row = s.db.QueryRow(
+	row = s.reader.QueryRow(
 		`SELECT COALESCE(MAX(id), 0) FROM events WHERE session_id=? AND type IN ('result','error')`,
 		sessionID,
 	)
@@ -431,7 +657,7 @@ func (s *Store) TurnState(sessionID string) (TurnState, error) {
 
 // SessionIDs returns all distinct session IDs that have events.
 func (s *Store) SessionIDs() ([]string, error) {
-	rows, err := s.db.Query(`SELECT DISTINCT session_id FROM events ORDER BY session_id`)
+	rows, err := s.reader.Query(`SELECT DISTINCT session_id FROM events ORDER BY session_id`)
 	if err != nil {
 		return nil, err
 	}

@@ -57,7 +57,7 @@ func (s *Store) EventPage(sessionID string, limitTurns int, before int64) ([]Eve
 		args = append(args, before)
 	}
 	q += ` ORDER BY id ASC`
-	rows, err := s.db.Query(q, args...)
+	rows, err := s.reader.Query(q, args...)
 	if err != nil {
 		return nil, false, err
 	}
@@ -81,7 +81,7 @@ func (s *Store) EventPage(sessionID string, limitTurns int, before int64) ([]Eve
 	// or the event floor).
 	more := false
 	if start > 0 {
-		if err := s.db.QueryRow(
+		if err := s.reader.QueryRow(
 			`SELECT EXISTS(SELECT 1 FROM events WHERE session_id=? AND id < ?)`,
 			sessionID, start,
 		).Scan(&more); err != nil {
@@ -104,7 +104,7 @@ func (s *Store) turnWindowStart(sessionID string, limitTurns int, before int64) 
 	}
 	q += ` ORDER BY id DESC LIMIT ?`
 	args = append(args, limitTurns)
-	rows, err := s.db.Query(q, args...)
+	rows, err := s.reader.Query(q, args...)
 	if err != nil {
 		return 0, err
 	}
@@ -141,7 +141,7 @@ func (s *Store) eventFloorStart(sessionID string, cap int, before int64) (int64,
 	q += ` ORDER BY id DESC LIMIT 1 OFFSET ?`
 	args = append(args, cap-1)
 	var id int64
-	err := s.db.QueryRow(q, args...).Scan(&id)
+	err := s.reader.QueryRow(q, args...).Scan(&id)
 	if err == sql.ErrNoRows {
 		return 0, nil
 	}
@@ -179,7 +179,7 @@ func (s *Store) Validators(ids []string) (map[string]SessionValidator, error) {
 		var maxID sql.NullInt64
 		var count int
 		var updated sql.NullString
-		err := s.db.QueryRow(
+		err := s.reader.QueryRow(
 			`SELECT COALESCE(MAX(id), 0), COUNT(*), MAX(created_at) FROM events WHERE session_id=?`,
 			id,
 		).Scan(&maxID, &count, &updated)
