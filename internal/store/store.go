@@ -40,21 +40,41 @@ type Store struct {
 	reader *sql.DB
 }
 
+// busyTimeoutMillisecondsWanted is how long a connection waits for a lock
+// before giving up. Named so both pools' DSNs and the check that proves the
+// writer's took effect cannot drift apart.
+const busyTimeoutMillisecondsWanted = 5000
+
 func New(dbPath string) (*Store, error) {
 	dir := filepath.Dir(dbPath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, fmt.Errorf("create db dir: %w", err)
 	}
-	writer, err := sql.Open("sqlite", dbPath)
+	writer, err := sql.Open("sqlite", fmt.Sprintf("%s?_pragma=busy_timeout(%d)", dbPath, busyTimeoutMillisecondsWanted))
 	if err != nil {
 		return nil, err
 	}
 	// journal_mode is a property of the database file, so this one Exec sets
-	// WAL for the reader pool too. busy_timeout is per-connection and the
-	// reader carries its own in the DSN below.
-	if _, err := writer.Exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;"); err != nil {
+	// WAL for the reader pool too. busy_timeout is per-connection, so both
+	// pools carry their own in the DSN — a one-shot Exec would reach only
+	// whichever connection the pool happened to hand out. The writer is capped
+	// at one connection below, which used to make the Exec form work by
+	// accident; it stops working the moment that connection is replaced.
+	if _, err := writer.Exec("PRAGMA journal_mode=WAL"); err != nil {
 		writer.Close()
-		return nil, fmt.Errorf("sqlite pragmas: %w", err)
+		return nil, fmt.Errorf("enable WAL: %w", err)
+	}
+	// An unrecognised DSN key is silently ignored by this driver, so prove the
+	// setting actually took effect instead of trusting the connection string.
+	var writerBusyTimeoutMilliseconds int
+	if err := writer.QueryRow("PRAGMA busy_timeout").Scan(&writerBusyTimeoutMilliseconds); err != nil {
+		writer.Close()
+		return nil, fmt.Errorf("read writer busy_timeout pragma: %w", err)
+	}
+	if writerBusyTimeoutMilliseconds != busyTimeoutMillisecondsWanted {
+		writer.Close()
+		return nil, fmt.Errorf("writer busy_timeout is %d, want %d: the DSN did not take effect",
+			writerBusyTimeoutMilliseconds, busyTimeoutMillisecondsWanted)
 	}
 	writer.SetMaxOpenConns(1)
 
@@ -63,7 +83,8 @@ func New(dbPath string) (*Store, error) {
 	// per-connection. Verified by behaviour, not by reading the pragma back:
 	// TestAWriteThroughTheReaderPoolIsRefused drives 40 concurrent writes
 	// through this handle and every one must fail.
-	reader, err := sql.Open("sqlite", dbPath+"?_pragma=query_only(1)&_pragma=busy_timeout(5000)")
+	reader, err := sql.Open("sqlite", fmt.Sprintf("%s?_pragma=query_only(1)&_pragma=busy_timeout(%d)",
+		dbPath, busyTimeoutMillisecondsWanted))
 	if err != nil {
 		writer.Close()
 		return nil, err
