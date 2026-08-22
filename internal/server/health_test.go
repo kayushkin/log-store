@@ -37,6 +37,21 @@ func getHealth(t *testing.T, srv *Server) (int, map[string]any) {
 	return rec.Code, body
 }
 
+// forwardingBlock pulls the forwarding report out of a /health body.
+//
+// It exists so a missing block is a clean failure of the test that asked for
+// it. An unchecked type assertion here panics, and a panic aborts the whole
+// test binary — every test declared after it then never runs and grades as
+// passing, which is how a sabotage that deletes this block scored SURVIVED.
+func forwardingBlock(t *testing.T, body map[string]any) map[string]any {
+	t.Helper()
+	fwd, ok := body["logstack_forwarding"].(map[string]any)
+	if !ok {
+		t.Fatalf("/health carries no logstack_forwarding block: %v", body)
+	}
+	return fwd
+}
+
 func resultEvent() msg.Event {
 	return msg.Event{
 		Type:            msg.EventResult,
@@ -78,10 +93,7 @@ func TestHealthGoesDegradedWhenForwardingIsBroken(t *testing.T) {
 		t.Fatalf("status = %v, want \"degraded\" — /health still says ok while every event is dropped", body["status"])
 	}
 
-	fwd, ok := body["logstack_forwarding"].(map[string]any)
-	if !ok {
-		t.Fatalf("/health carries no logstack_forwarding block: %v", body)
-	}
+	fwd := forwardingBlock(t, body)
 	if fwd["target_url"] != logstack.URL {
 		t.Fatalf("target_url = %v, want %q — a reader cannot fix a URL the report does not name", fwd["target_url"], logstack.URL)
 	}
@@ -111,7 +123,7 @@ func TestHealthIsOKWhenForwardingWorks(t *testing.T) {
 		t.Fatalf("status = %v, want \"ok\" — a working forwarder must not report degraded", body["status"])
 	}
 
-	fwd := body["logstack_forwarding"].(map[string]any)
+	fwd := forwardingBlock(t, body)
 	if fwd["succeeded"] != float64(1) {
 		t.Fatalf("succeeded = %v, want 1", fwd["succeeded"])
 	}
@@ -142,7 +154,7 @@ func TestHealthAnswersWithoutAForwarder(t *testing.T) {
 	if body["status"] != "ok" {
 		t.Fatalf("status = %v, want \"ok\"", body["status"])
 	}
-	fwd := body["logstack_forwarding"].(map[string]any)
+	fwd := forwardingBlock(t, body)
 	if fwd["target_url"] != "" {
 		t.Fatalf("target_url = %v, want \"\" — an empty target is how a reader tells there is no forwarder", fwd["target_url"])
 	}
