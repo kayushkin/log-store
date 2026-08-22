@@ -370,8 +370,37 @@ func (s *Server) handleAggregates(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, out)
 }
 
+// healthResponse is what GET /health answers.
+//
+// It carries the logstack forwarder's record because the forwarder is the one
+// part of this service that can fail completely and continuously without
+// affecting any response it gives: ingest still returns 200, events are still
+// stored, and every forwarded event is dropped. Reporting only liveness here
+// is what let 287,106 consecutive forwarding failures go unnoticed for five
+// weeks.
+type healthResponse struct {
+	Status             string              `json:"status"`
+	LogstackForwarding ls.ForwardingHealth `json:"logstack_forwarding"`
+}
+
+const (
+	// statusOK means the process is serving and its forwarder is not failing.
+	statusOK = "ok"
+	// statusDegraded means the service answers, but something it is
+	// responsible for is not working. It is deliberately not "error": the
+	// store is fine and refusing traffic would be the wrong response.
+	statusDegraded = "degraded"
+)
+
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, map[string]string{"status": "ok"})
+	forwarding := s.forwarder.Health()
+
+	status := statusOK
+	if forwarding.Degraded() {
+		status = statusDegraded
+	}
+
+	writeJSON(w, healthResponse{Status: status, LogstackForwarding: forwarding})
 }
 
 func writeJSON(w http.ResponseWriter, v interface{}) {
