@@ -753,3 +753,81 @@ func TestBuildTurnModel_ThinkingOnlyTurnPromotesNothing(t *testing.T) {
 		t.Errorf("a thinking-only turn must promote nothing; got primary=%v duplicate=%v", e.Primary, e.Duplicate)
 	}
 }
+
+// A stream delta or block echo carrying REASONING classifies as "thinking", not "text".
+//
+// This returned "text" for every stream and block, which put the materializer at odds
+// with the live reducer about the same event: chat-core's `kindOf` classifies by the
+// block type, and this file's own header claims to mirror it exactly. A session's
+// reasoning was therefore filed as prose the moment it was materialized, so every
+// surface asking for kind "thinking" found it live and found nothing on a reload.
+//
+// ⚠️ Relabelling does not put reasoning back on screen and must not be read as having
+// done so. The TEXT is gone before it reaches this service — Claude Code records its
+// thinking blocks with `thinking: ""` plus a signature, so of the 98,959 thinking blocks
+// stored on this host ZERO carry text. This corrects the label on an empty box; the
+// client keeps its own live copy.
+func TestBuildTurnModel_ReasoningIsThinkingNotText(t *testing.T) {
+	base := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+	rows := []store.EventRow{
+		// Prose, both shapes — these must stay "text".
+		mkRow(t, 1, msg.Event{Type: msg.EventStream, TurnID: "t1", Timestamp: base,
+			Stream: &msg.HarnessStream{Delta: &msg.BlockDelta{Type: msg.DeltaText, Text: "the answer"}}}),
+		mkRow(t, 2, msg.Event{Type: msg.EventBlock, TurnID: "t1", Timestamp: base.Add(time.Second),
+			Block: &msg.BlockEvent{Block: &msg.ContentBlock{Type: msg.BlockText, Text: &msg.TextBlock{Text: "the answer"}}}}),
+		// Reasoning, both shapes — these must become "thinking".
+		mkRow(t, 3, msg.Event{Type: msg.EventStream, TurnID: "t1", Timestamp: base.Add(2 * time.Second),
+			Stream: &msg.HarnessStream{Delta: &msg.BlockDelta{Type: msg.DeltaThinking, Thinking: "weighing it"}}}),
+		mkRow(t, 4, msg.Event{Type: msg.EventBlock, TurnID: "t1", Timestamp: base.Add(3 * time.Second),
+			Block: &msg.BlockEvent{Block: &msg.ContentBlock{Type: msg.BlockThinking, Thinking: &msg.ThinkingBlock{Text: ""}}}}),
+	}
+	m := buildTurnModel("sess", rows, false)
+
+	kindOf := map[int64]string{}
+	for _, e := range m.Entries {
+		kindOf[e.EventID] = e.Kind
+	}
+	for id, want := range map[int64]string{1: "text", 2: "text", 3: "thinking", 4: "thinking"} {
+		if got := kindOf[id]; got != want {
+			t.Errorf("event %d classified %q, want %q", id, got, want)
+		}
+	}
+}
+
+// A REDACTED thinking block is reasoning too. The model declined to show it, which is
+// still not prose — filing it as the assistant's answer would put an empty bubble in the
+// conversation where an unreadable thought belongs.
+func TestBuildTurnModel_RedactedThinkingIsReasoning(t *testing.T) {
+	base := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+	rows := []store.EventRow{
+		mkRow(t, 1, msg.Event{Type: msg.EventBlock, TurnID: "t1", Timestamp: base,
+			Block: &msg.BlockEvent{Block: &msg.ContentBlock{
+				Type: msg.BlockRedactedThinking, RedactedThinking: &msg.RedactedThinkingBlock{},
+			}}}),
+	}
+	m := buildTurnModel("sess", rows, false)
+	for _, e := range m.Entries {
+		if e.Kind != "thinking" {
+			t.Errorf("redacted thinking classified %q, want thinking", e.Kind)
+		}
+	}
+}
+
+// A reasoning block must NOT be promoted into the collapsed Turns view by the
+// unsuperseded-block pass. That pass exists so a subagent turn with no result still
+// shows what was said; reasoning is not what was said.
+func TestBuildTurnModel_ReasoningIsNotPromotedAsProse(t *testing.T) {
+	base := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+	rows := []store.EventRow{
+		mkRow(t, 1, msg.Event{Type: msg.EventBlock, TurnID: "t1", Timestamp: base,
+			Block: &msg.BlockEvent{Block: &msg.ContentBlock{
+				Type: msg.BlockThinking, Thinking: &msg.ThinkingBlock{Text: "reasoning here"},
+			}}}),
+	}
+	m := buildTurnModel("sess", rows, false)
+	for _, e := range m.Entries {
+		if e.Kind == "thinking" && e.Primary {
+			t.Error("a reasoning block was promoted as prose in the collapsed view")
+		}
+	}
+}

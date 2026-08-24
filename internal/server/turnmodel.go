@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/kayushkin/log-store/internal/store"
 	"github.com/kayushkin/llm-bridge/msg"
+	"github.com/kayushkin/log-store/internal/store"
 )
 
 // The wire types below mirror chat-core/src/net/types.ts EXACTLY (camelCase
@@ -233,10 +233,52 @@ func classify(ev *msg.Event) (role, kind string, conversation bool) {
 	case msg.EventStream, msg.EventBlock:
 		// Streaming partials / per-block echoes are superseded by the message's
 		// result in the collapsed view, but retained for the raw Timeline.
+		//
+		// ⚠️ A stream or block carrying REASONING is kind "thinking", not "text".
+		// This returned "text" for every one of them, which disagreed with the live
+		// reducer about the same event — chat-core's `kindOf` classifies by the block
+		// type (`reduce/TurnReducer.ts`) and this file's own header claims to mirror
+		// it exactly. So a session's reasoning was labelled prose the moment it was
+		// materialized, and every surface that asks for kind "thinking" found nothing
+		// on a reload while finding it live. Same class of bug as the task events
+		// described above, and the same fix: classify by what the event IS.
+		//
+		// ⚠️ Relabelling does NOT put reasoning back on screen, and it must not be
+		// mistaken for having done so. The reasoning TEXT is gone before it reaches
+		// this service: Claude Code records its thinking blocks with `thinking: ""`
+		// and a signature, so of the 98,959 thinking blocks stored here ZERO carry
+		// text, and text last appeared in quantity in 2026-04. This corrects the label
+		// on an empty box. The client keeps its own live copy (`carryForwardReasoning`
+		// in chat-core) because the live stream is the only place reasoning exists.
+		if isReasoningPayload(ev) {
+			return "assistant", "thinking", false
+		}
 		return "assistant", "text", false
 	default:
 		return "assistant", "meta", false
 	}
+}
+
+// isReasoningPayload reports whether a stream delta or block echo carries model
+// REASONING rather than prose.
+//
+// The two shapes are the ones the gateway really forwards, verified against stored
+// events rather than inferred from the Go types:
+//
+//	stream: {"stream": {"delta": {"type": "thinking_delta", "thinking": "…"}}}
+//	block:  {"block": {"block": {"type": "thinking", "thinking_block": {…}}}}
+//
+// A redacted thinking block counts too: it is reasoning the model declined to show,
+// which is still not prose and must not be filed as the assistant's answer.
+func isReasoningPayload(ev *msg.Event) bool {
+	if ev.Stream != nil && ev.Stream.Delta != nil {
+		return ev.Stream.Delta.Type == msg.DeltaThinking
+	}
+	if ev.Block != nil && ev.Block.Block != nil {
+		b := ev.Block.Block
+		return b.Thinking != nil || b.RedactedThinking != nil
+	}
+	return false
 }
 
 // entryText extracts the logical text used both for display and as the dedup
