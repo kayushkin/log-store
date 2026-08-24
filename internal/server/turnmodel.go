@@ -29,6 +29,18 @@ type Entry struct {
 	EventID int64  `json:"eventId"`
 	Ts      string `json:"ts"`
 
+	// MessageID is the canonical bridge-server-assigned id of the chat message
+	// this event belongs to (Event.MessageID, "msg_…"), mapped 1:1 — never
+	// invented, never taken from the harness-native variant ids. The live
+	// reducer (chat-core groupKeyFor) reads only the same top-level field, so
+	// the two paths agree by construction; a fallback to block.message_id or
+	// raw.message.id would create a place for them to disagree. Measured on
+	// this host before wiring: the top-level id is present on every block,
+	// tool_call, tool_result, user_message and result event, and the variant
+	// paths are never populated where it is not. Empty for bookkeeping events
+	// (system, session_state, api_call, …) that belong to no message bubble.
+	MessageID string `json:"messageId,omitempty"`
+
 	Text       string          `json:"text,omitempty"`
 	ToolName   string          `json:"toolName,omitempty"`
 	ToolInput  json.RawMessage `json:"toolInput,omitempty"`
@@ -394,6 +406,7 @@ func buildTurnModel(sessionID string, rows []store.EventRow, more bool) TurnMode
 			textBlockIDs[id] = true
 		}
 		e.HarnessParentID = ev.HarnessParentID
+		e.MessageID = ev.MessageID
 		if isRecovered(&ev) {
 			e.Recovered = true
 		}
@@ -497,6 +510,12 @@ func buildTurnModel(sessionID string, rows []store.EventRow, more bool) TurnMode
 	// that never arrives, and every collapsed surface rendered the session empty.
 	// Runs after A1 so the two passes cannot both promote in one turn.
 	surfaceUnsupersededBlocks(turns, entries, textBlockIDs)
+
+	// Keep NARRATION visible even in turns a result supersedes. A text block
+	// whose message also carries a tool use is commentary written before
+	// acting, and the result never repeats it — hiding it as "superseded"
+	// erased it from every reload while the live view drew it.
+	surfaceNarrationBlocks(entries, textBlockIDs)
 
 	// Validator is derived from the events actually present. maxEventID is the
 	// high-water row id in this page; the count endpoint (/validators) reports
@@ -698,6 +717,56 @@ func surfaceUnsupersededBlocks(turns []Turn, entries map[string]Entry, textBlock
 			e.Duplicate = false
 			entries[eid] = e
 		}
+	}
+}
+
+// surfaceNarrationBlocks promotes a turn's NARRATION text blocks to visible primary
+// atoms even when the turn's result would otherwise supersede them. Mutates
+// `entries` in place; non-destructive like every other pass here — it flips
+// duplicate/primary annotation and drops nothing.
+//
+// The rule: a text block whose message also carries a tool use is narration —
+// the assistant announcing what it is about to do — and the terminating result
+// never contains that text. Measured on one real turn
+// (turn_01M0TPBZVZBX02T…, session br_1787601675531668005): of its 96 distinct
+// messages, 31 carry text and 30 of those also carry a tool call; none of the
+// 30 texts appear in the result. The blanket "a healthy turn's result repeats
+// their text" supersession is true only of the ANSWER block — the one text
+// message with no tool use — which stays superseded exactly as before.
+//
+// Without this pass the live view (which renders narration from block echoes)
+// and a reload (which renders !duplicate entries) disagree: 30 narration rows
+// live, zero after refresh. That live-vs-materialized divergence is the class
+// of bug the per-message design exists to end (dash
+// docs/dashv2-turns-per-message.md §2).
+//
+// The join is the canonical MessageID, built over the whole page rather than
+// per turn — message ids are globally unique, so the wider scope costs nothing
+// and survives a page boundary splitting a turn. A block with no message id
+// cannot be classified and keeps its default annotation. Recovered/OTel text
+// stays A1's candidate, never this pass's — the same disjointness rule
+// surfaceUnsupersededBlocks follows.
+func surfaceNarrationBlocks(entries map[string]Entry, textBlockIDs map[string]bool) {
+	tooledMessages := map[string]bool{}
+	for _, e := range entries {
+		if e.Kind == "tool_call" && e.MessageID != "" {
+			tooledMessages[e.MessageID] = true
+		}
+	}
+	if len(tooledMessages) == 0 {
+		return
+	}
+	for eid := range textBlockIDs {
+		e := entries[eid]
+		if e.Text == "" || e.MessageID == "" || !tooledMessages[e.MessageID] {
+			continue
+		}
+		if isRecoveredOrOTelAssistantText(e) {
+			continue
+		}
+		e.Primary = true
+		e.Duplicate = false
+		entries[eid] = e
 	}
 }
 

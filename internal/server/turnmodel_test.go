@@ -831,3 +831,125 @@ func TestBuildTurnModel_ReasoningIsNotPromotedAsProse(t *testing.T) {
 		}
 	}
 }
+
+// narrationTextBlock is harnessTextBlock plus the canonical MessageID — the shape
+// every real Claude Code block echo arrives in (measured: the top-level
+// message_id is present on every stored block event on this host).
+func narrationTextBlock(t *testing.T, id int64, ts time.Time, messageID, text string) store.EventRow {
+	t.Helper()
+	return mkRow(t, id, msg.Event{
+		Type:      msg.EventBlock,
+		TurnID:    "turn1",
+		MessageID: messageID,
+		Timestamp: ts,
+		Block: &msg.BlockEvent{
+			Block: &msg.ContentBlock{Type: "text", Text: &msg.TextBlock{Text: text}},
+		},
+	})
+}
+
+// Every entry carries the canonical MessageID, mapped 1:1 from the event, and it
+// serializes under the wire name `messageId`. Both render paths group by this id,
+// so live and materialized entries for the same event must agree on it.
+func TestBuildTurnModel_MessageIDOnTheWire(t *testing.T) {
+	base := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+	rows := []store.EventRow{
+		mkRow(t, 1, msg.Event{Type: msg.EventUserMessage, TurnID: "turn1", MessageID: "msg_user", Timestamp: base, Result: &msg.ResultEvent{Text: "q"}}),
+		narrationTextBlock(t, 2, base.Add(time.Second), "msg_a", "Now the detection change:"),
+		mkRow(t, 3, msg.Event{Type: msg.EventToolCall, TurnID: "turn1", MessageID: "msg_a", Timestamp: base.Add(2 * time.Second), ToolCall: &msg.ToolCallEvent{ToolID: "t1", Name: "Edit", Input: json.RawMessage(`{}`)}}),
+		mkRow(t, 4, msg.Event{Type: msg.EventResult, TurnID: "turn1", MessageID: "msg_b", Timestamp: base.Add(3 * time.Second), Result: &msg.ResultEvent{Text: "done"}}),
+	}
+	m := buildTurnModel("s", rows, false)
+
+	want := map[string]string{"e_1": "msg_user", "e_2": "msg_a", "e_3": "msg_a", "e_4": "msg_b"}
+	for id, mid := range want {
+		if got := m.Entries[id].MessageID; got != mid {
+			t.Errorf("%s messageId = %q, want %q", id, got, mid)
+		}
+	}
+
+	// The wire name, so a Go rename cannot silently break the client.
+	b, err := json.Marshal(m.Entries["e_2"])
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var wire map[string]any
+	if err := json.Unmarshal(b, &wire); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if wire["messageId"] != "msg_a" {
+		t.Errorf("wire messageId = %v, want msg_a", wire["messageId"])
+	}
+	// Bookkeeping events carry none, and the field must be OMITTED, not "".
+	// Fresh map: Unmarshal into a populated one MERGES keys, it does not reset.
+	b, _ = json.Marshal(Entry{ID: "x", Kind: "meta"})
+	wire = map[string]any{}
+	if err := json.Unmarshal(b, &wire); err != nil {
+		t.Fatalf("unmarshal empty: %v", err)
+	}
+	if _, present := wire["messageId"]; present {
+		t.Errorf("empty messageId must be omitted from the wire")
+	}
+}
+
+// The supersession fix. A text block whose message ALSO carries a tool use is
+// narration — the result never repeats it — so it stays visible even though the
+// turn ends in a result. The answer block (text, no tool use on its message)
+// stays superseded exactly as before. This is the live-vs-materialized parity
+// the per-message design depends on: without it, live shows the narration rows
+// and a reload shows zero.
+func TestBuildTurnModel_NarrationBlocksSurviveResultSupersession(t *testing.T) {
+	base := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+	rows := []store.EventRow{
+		mkRow(t, 1, msg.Event{Type: msg.EventUserMessage, TurnID: "turn1", MessageID: "msg_u", Timestamp: base, Result: &msg.ResultEvent{Text: "do the thing"}}),
+		// Narration message: text + tool use, same message id.
+		narrationTextBlock(t, 2, base.Add(1*time.Second), "msg_narr", "Now the detection change in `refChips.ts`:"),
+		mkRow(t, 3, msg.Event{Type: msg.EventToolCall, TurnID: "turn1", MessageID: "msg_narr", Timestamp: base.Add(2 * time.Second), ToolCall: &msg.ToolCallEvent{ToolID: "t1", Name: "Edit", Input: json.RawMessage(`{}`)}}),
+		mkRow(t, 4, msg.Event{Type: msg.EventToolResult, TurnID: "turn1", MessageID: "msg_tr", Timestamp: base.Add(3 * time.Second), ToolResult: &msg.ToolResultEvent{ToolID: "t1", Name: "Edit", Output: "ok"}}),
+		// Answer message: text, NO tool use.
+		narrationTextBlock(t, 5, base.Add(4*time.Second), "msg_answer", "All done — the change is in."),
+		mkRow(t, 6, msg.Event{Type: msg.EventResult, TurnID: "turn1", MessageID: "msg_answer", Timestamp: base.Add(5 * time.Second), Result: &msg.ResultEvent{Text: "All done — the change is in."}}),
+	}
+	m := buildTurnModel("s", rows, false)
+
+	if e := m.Entries["e_2"]; e.Duplicate || !e.Primary {
+		t.Errorf("narration block must survive the result; got primary=%v duplicate=%v", e.Primary, e.Duplicate)
+	}
+	if e := m.Entries["e_5"]; !e.Duplicate || e.Primary {
+		t.Errorf("answer block must stay superseded by the result that repeats it; got primary=%v duplicate=%v", e.Primary, e.Duplicate)
+	}
+	if e := m.Entries["e_6"]; e.Duplicate || !e.Primary {
+		t.Errorf("result must stay visible; got primary=%v duplicate=%v", e.Primary, e.Duplicate)
+	}
+}
+
+// A block with NO message id cannot be classified as narration, and must keep the
+// old superseded default rather than being guessed at. This is also what keeps
+// pre-message-id history rendering exactly as it always has.
+func TestBuildTurnModel_BlockWithoutMessageIDKeepsOldSupersession(t *testing.T) {
+	base := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+	rows := []store.EventRow{
+		harnessTextBlock(t, 1, base, "legacy block, no message id"),
+		mkRow(t, 2, msg.Event{Type: msg.EventToolCall, TurnID: "", MessageID: "msg_x", Timestamp: base.Add(time.Second), ToolCall: &msg.ToolCallEvent{ToolID: "t1", Name: "Bash", Input: json.RawMessage(`{}`)}}),
+		mkRow(t, 3, msg.Event{Type: msg.EventResult, TurnID: "", MessageID: "msg_r", Timestamp: base.Add(2 * time.Second), Result: &msg.ResultEvent{Text: "done"}}),
+	}
+	m := buildTurnModel("s", rows, false)
+	if e := m.Entries["e_1"]; !e.Duplicate || e.Primary {
+		t.Errorf("id-less block must keep the old superseded default; got primary=%v duplicate=%v", e.Primary, e.Duplicate)
+	}
+}
+
+// A THINKING block on a tooled message is reasoning, not narration — it must not
+// be promoted into the collapsed view as prose. Only text blocks are candidates.
+func TestBuildTurnModel_ThinkingOnTooledMessageIsNotNarration(t *testing.T) {
+	base := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+	rows := []store.EventRow{
+		mkRow(t, 1, msg.Event{Type: msg.EventBlock, TurnID: "turn1", MessageID: "msg_a", Timestamp: base, Block: &msg.BlockEvent{Block: &msg.ContentBlock{Type: "thinking", Thinking: &msg.ThinkingBlock{Text: "let me think"}}}}),
+		mkRow(t, 2, msg.Event{Type: msg.EventToolCall, TurnID: "turn1", MessageID: "msg_a", Timestamp: base.Add(time.Second), ToolCall: &msg.ToolCallEvent{ToolID: "t1", Name: "Bash", Input: json.RawMessage(`{}`)}}),
+		mkRow(t, 3, msg.Event{Type: msg.EventResult, TurnID: "turn1", MessageID: "msg_r", Timestamp: base.Add(2 * time.Second), Result: &msg.ResultEvent{Text: "done"}}),
+	}
+	m := buildTurnModel("s", rows, false)
+	if e := m.Entries["e_1"]; !e.Duplicate || e.Primary {
+		t.Errorf("thinking block must not be promoted as narration; got primary=%v duplicate=%v", e.Primary, e.Duplicate)
+	}
+}
