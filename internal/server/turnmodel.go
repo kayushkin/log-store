@@ -47,6 +47,41 @@ type Entry struct {
 	ToolResult json.RawMessage `json:"toolResult,omitempty"`
 	Raw        json.RawMessage `json:"raw,omitempty"`
 
+	// The four fields below exist so that `raw` can stop being shipped on the
+	// default page. Every one of them was being dug back out of `raw` by a
+	// consumer, which is what made an 8 MB blob per page load-bearing for facts
+	// that fit in a few bytes. Measured 2026-08-25 on a real 30-message page:
+	// `raw` was 7.82 MB of 9.91 MB (78.9%), and the Turns view never renders it —
+	// only the Raw pane does (dash TurnList.tsx, `if (view !== 'raw') return null`).
+	//
+	// They are mapped 1:1 from the canonical event and never invented, exactly
+	// like Code/Retryable/Subtype above.
+
+	// ToolID is the canonical tool id, from ToolCallEvent.ToolID or
+	// ToolResultEvent.ToolID. It is what pairs a call with its result.
+	//
+	// ⚠️ Load-bearing, and it has already broken once. chat-core answers "did
+	// this call finish?" by pairing on this id (store/toolPairing.ts), and
+	// reading it from `raw` is what fixed history pages rendering every
+	// completed tool call as still running. Drop `raw` without this field and
+	// that bug returns on every cold load.
+	ToolID string `json:"toolId,omitempty"`
+
+	// ToolError is ToolResultEvent.IsError — whether the tool failed. Read by
+	// chat-core selectors and dash toolEvents.ts to style the tool card.
+	ToolError bool `json:"toolError,omitempty"`
+
+	// ClientRequestID is Event.ClientRequestID, the caller-minted per-turn id.
+	// chat-core correlates an optimistic user row against the real user_message
+	// with it (reduce/TurnReducer.ts); without it the correlation falls back to
+	// normalized text, which cannot tell two identical prompts apart.
+	ClientRequestID string `json:"clientRequestId,omitempty"`
+
+	// EventType is the canonical Event.Type. chat-core's terminal-state
+	// selector reads it to decide whether a session ended (reduce/terminalState.ts)
+	// for the event types that carry no dedicated Kind of their own.
+	EventType string `json:"eventType,omitempty"`
+
 	// Usage is the per-message token usage for assistant/result entries,
 	// mapped 1:1 from the terminating ResultEvent.Usage (msg.TokenUsage). Nil
 	// (omitted) for entries with no usage meta — user prompts, tool calls,
@@ -151,6 +186,12 @@ type TurnModel struct {
 	// this page. Nil (omitted) when no api_spend_total or context-bearing usage
 	// event is present in the window — legacy/no-cost sessions are unaffected.
 	Aggregates *TurnAggregates `json:"aggregates,omitempty"`
+
+	// SourceGroups is present ONLY on a projected page (see project.go) and carries
+	// the one fact the dropped duplicate entries were still being shipped for: which
+	// sources reported each dedup group. Absent on `/messages/raw`, where every
+	// duplicate is present and a reader can count them itself.
+	SourceGroups SourceGroups `json:"sourceGroups,omitempty"`
 }
 
 // MessagesResponse is the /sessions/{id}/messages?limit= wire shape.
@@ -369,6 +410,10 @@ func buildTurnModel(sessionID string, rows []store.EventRow, more bool) TurnMode
 			EventID: r.ID,
 			Ts:      formatTS(ev.Timestamp),
 			Raw:     append(json.RawMessage(nil), r.Data...),
+			// Promoted off `raw` so the projected page can drop it — see the
+			// field comments on Entry.
+			ClientRequestID: ev.ClientRequestID,
+			EventType:       string(ev.Type),
 		}
 		switch ev.Type {
 		case msg.EventUserMessage, msg.EventResult, msg.EventThinking, msg.EventStream, msg.EventBlock, msg.EventError, msg.EventSystem:
@@ -377,11 +422,14 @@ func buildTurnModel(sessionID string, rows []store.EventRow, more bool) TurnMode
 			if ev.ToolCall != nil {
 				e.ToolName = ev.ToolCall.Name
 				e.ToolInput = ev.ToolCall.Input
+				e.ToolID = ev.ToolCall.ToolID
 			}
 		case msg.EventToolResult:
 			if ev.ToolResult != nil {
 				e.ToolName = ev.ToolResult.Name
 				e.ToolResult = json.RawMessage(quoteJSON(ev.ToolResult.Output))
+				e.ToolID = ev.ToolResult.ToolID
+				e.ToolError = ev.ToolResult.IsError
 			}
 		}
 		// Kind-specific fields, mapped straight from the canonical event.

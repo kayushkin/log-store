@@ -26,6 +26,10 @@ func New(s *store.Store, forwarder *ls.Forwarder) *Server {
 	srv.mux.HandleFunc("GET /api/v1/sessions/search", srv.handleSearch)
 	srv.mux.HandleFunc("GET /api/v1/sessions/aggregates", srv.handleAggregates)
 	srv.mux.HandleFunc("GET /api/v1/sessions/{id}/messages", srv.handleMessages)
+	// The unprojected model, for the Raw pane and for audit. Its own route rather
+	// than a query param on the line above so the two answers cache separately and
+	// a caller cannot ask for the 10x payload by accident. See project.go.
+	srv.mux.HandleFunc("GET /api/v1/sessions/{id}/messages/raw", srv.handleMessagesRaw)
 	srv.mux.HandleFunc("GET /api/v1/sessions/{id}/history", srv.handleHistory)
 	// dashv2 additive endpoints — turn-model materialization + validators.
 	srv.mux.HandleFunc("GET /api/v1/sessions/validators", srv.handleValidators)
@@ -130,6 +134,38 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	writeJSON(w, MessagesResponse{Model: projectForReading(model)})
+}
+
+// handleMessagesRaw serves the UNPROJECTED turn model: every entry the window
+// holds, duplicates included, each carrying its full `raw` source event.
+//
+// This is what `/messages` used to serve, and it is what the Raw pane and any audit
+// reader needs — a page it can reconstruct the event stream from. It is a separate
+// route because it is roughly ten times the size (measured 9.91 MB against 0.92 MB on
+// one real session), so asking for it has to be deliberate.
+//
+// Same bounds as `/messages`: `limit` defaults to 30 and `before` pages older. There
+// is no unbounded shape here — the legacy full-stream materialize is what produced
+// 306 MB and 85 seconds for one session, and it is not reachable from this route.
+func (s *Server) handleMessagesRaw(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	q := r.URL.Query()
+
+	limit := 30
+	if n, err := strconv.Atoi(q.Get("limit")); err == nil && n > 0 {
+		limit = n
+	}
+	var before int64
+	if n, err := strconv.ParseInt(q.Get("before"), 10, 64); err == nil && n > 0 {
+		before = n
+	}
+
+	model, err := s.materializeTail(id, limit, before)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	writeJSON(w, MessagesResponse{Model: model})
 }
 
@@ -193,7 +229,11 @@ func (s *Server) handleBundle(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		out[id] = model
+		// Projected for the same reason `/messages` is, and it matters more here: the
+		// bundle is the COLD-BOOT payload and it multiplies by the session count.
+		// Measured 2026-08-25, `recent-bundle?n=20&turns=30` was 29.1 MB in a single
+		// response before this.
+		out[id] = projectForReading(model)
 	}
 	writeJSON(w, out)
 }
