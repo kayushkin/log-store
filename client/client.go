@@ -64,10 +64,26 @@ type TurnState struct {
 	InFlight               bool  `json:"in_flight"`
 }
 
+// escapePathSegment makes a value safe to paste into a URL path as ONE segment.
+//
+// A session id is not this client's own value — every caller receives it from
+// the bridge or reads it back out of a stored record, and nothing checks it.
+// Pasted raw, an id holding "/" addresses a different endpoint, one holding "?"
+// turns the rest of the path into a query, and one holding "#" drops the rest of
+// the path entirely. None of those fail; they succeed, against the wrong URL.
+//
+// neturl.PathEscape, not neturl.QueryEscape: the two differ on a space, which
+// QueryEscape writes as "+" and a path reads back as a literal plus. The query
+// value in SessionsHoldingHarnessSessionID is QueryEscape'd and correctly so —
+// which escaper is right depends on the position, not on the value.
+func escapePathSegment(segment string) string {
+	return neturl.PathEscape(segment)
+}
+
 // GetTurnState fetches the per-session turn state.
 func (c *Client) GetTurnState(sessionID string) (TurnState, error) {
 	var ts TurnState
-	url := fmt.Sprintf("%s/api/v1/sessions/%s/turn-state", c.baseURL, sessionID)
+	url := fmt.Sprintf("%s/api/v1/sessions/%s/turn-state", c.baseURL, escapePathSegment(sessionID))
 	resp, err := c.httpClient.Get(url)
 	if err != nil {
 		return ts, fmt.Errorf("get turn-state: %w", err)
@@ -87,7 +103,7 @@ func (c *Client) GetTurnState(sessionID string) (TurnState, error) {
 // type and/or after a row ID. Pass afterID == 0 to read from the beginning,
 // types == nil to disable type filtering.
 func (c *Client) ListEvents(sessionID string, afterID int64, types []string) ([]json.RawMessage, error) {
-	url := fmt.Sprintf("%s/api/v1/sessions/%s/events?after=%d", c.baseURL, sessionID, afterID)
+	url := fmt.Sprintf("%s/api/v1/sessions/%s/events?after=%d", c.baseURL, escapePathSegment(sessionID), afterID)
 	if len(types) > 0 {
 		url += "&types=" + joinTypes(types)
 	}
@@ -124,7 +140,7 @@ type HeldSession struct {
 // transcripts into the production store: the check lived in a database the
 // store could not see.
 //
-// An empty id is refused here rather than sent, because '' is a real stored
+// An empty id is refused here rather than sent, because ” is a real stored
 // value (every session whose events name no harness id) and would match
 // thousands of unrelated rows.
 func (c *Client) SessionsHoldingHarnessSessionID(harnessSessionID string) ([]HeldSession, error) {
