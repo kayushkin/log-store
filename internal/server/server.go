@@ -345,7 +345,28 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 			limit = n
 		}
 	}
-	hits, err := s.store.SearchSessions(q, limit)
+	// Optional RFC3339 window. A malformed bound is a 400, never a silently
+	// unbounded scan: the caller asked for a window precisely because the
+	// unbounded scan takes ~50s on this host, and handing them that scan in
+	// place of an error would look like a hang.
+	var since, until time.Time
+	if v := r.URL.Query().Get("since"); v != "" {
+		t, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			http.Error(w, `{"error":"since must be RFC3339"}`, http.StatusBadRequest)
+			return
+		}
+		since = t
+	}
+	if v := r.URL.Query().Get("until"); v != "" {
+		t, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			http.Error(w, `{"error":"until must be RFC3339"}`, http.StatusBadRequest)
+			return
+		}
+		until = t
+	}
+	hits, err := s.store.SearchSessionsInWindow(q, limit, since, until)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

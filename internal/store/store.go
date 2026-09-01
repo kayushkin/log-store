@@ -1,6 +1,7 @@
 package store
 
 import (
+	"time"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -462,9 +463,55 @@ func harnessSessionIDOf(data []byte) string {
 // it is what the gateway keys its own unique index on. A consumer that 404s
 // on the first should retry on the second before calling a hit unrenderable.
 func (s *Store) SearchSessions(query string, limit int) ([]SearchHit, error) {
+	return s.SearchSessionsInWindow(query, limit, time.Time{}, time.Time{})
+}
+
+// SearchSessionsInWindow is SearchSessions bounded to events created inside
+// [since, until); a zero time leaves that side unbounded.
+//
+// The bound exists because the unwindowed scan is a raw LIKE over EVERY event
+// blob — measured 2026-09-01 at 47–56s against 2.3M events / 5.9GB, which is
+// unusable for any interactive caller. Most interactive questions are about a
+// MOMENT ("who committed this on Aug 22"), and the events table is append-only
+// with ids monotonic in created_at, so a time window translates to an id range
+// found by binary search over ~21 point reads — no created_at index needed,
+// and the LIKE then scans only the slice inside the range (the same query,
+// windowed to a day, answers in ~1s).
+//
+// Monotonicity is real, not assumed: id is the SQLite rowid handed out at
+// INSERT and created_at is stamped by the same INSERT's CURRENT_TIMESTAMP, so
+// a later row can never carry an earlier created_at beyond same-second ties —
+// and the binary search treats ties conservatively (>= on the left bound).
+func (s *Store) SearchSessionsInWindow(query string, limit int, since, until time.Time) ([]SearchHit, error) {
 	if limit <= 0 {
 		limit = 100
 	}
+	idConditions := ""
+	args := []any{query}
+	if !since.IsZero() {
+		lo, ok, err := s.firstEventIDAtOrAfter(since)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return []SearchHit{}, nil // every event predates the window
+		}
+		idConditions += " AND id >= ?"
+		args = append(args, lo)
+	}
+	if !until.IsZero() {
+		hi, ok, err := s.firstEventIDAtOrAfter(until)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			idConditions += " AND id < ?"
+			args = append(args, hi)
+		}
+		// No event at or after `until` means the window's right edge is past
+		// the end of the table — unbounded on that side, correctly.
+	}
+	args = append(args, limit)
 	// The join sits outside the LIMIT, not inside it. Joining in the same
 	// SELECT as the GROUP BY makes SQLite look up the projection once per
 	// matched group — 8,138 seeks for a whole-corpus query on this host, and
@@ -480,14 +527,14 @@ func (s *Store) SearchSessions(query string, limit int) ([]SearchHit, error) {
 		 FROM (
 			SELECT session_id, COUNT(*) AS match_count, MAX(id) AS last_event_id
 			FROM events
-			WHERE data LIKE '%' || ? || '%'
+			WHERE data LIKE '%' || ? || '%'`+idConditions+`
 			GROUP BY session_id
 			ORDER BY last_event_id DESC
 			LIMIT ?
 		 ) hit
 		 LEFT JOIN sessions s ON s.session_id = hit.session_id
 		 ORDER BY hit.last_event_id DESC`,
-		query, limit,
+		args...,
 	)
 	if err != nil {
 		return nil, err
@@ -502,6 +549,60 @@ func (s *Store) SearchSessions(query string, limit int) ([]SearchHit, error) {
 		hits = append(hits, h)
 	}
 	return hits, rows.Err()
+}
+
+// firstEventIDAtOrAfter finds the smallest event id whose created_at is at or
+// after t, by binary search over the id space — ~21 point reads against the
+// primary key instead of a full scan against the unindexed created_at column.
+// ok=false means no event is that late (t is past the end of the table).
+func (s *Store) firstEventIDAtOrAfter(t time.Time) (int64, bool, error) {
+	// created_at is stored as CURRENT_TIMESTAMP text ("YYYY-MM-DD HH:MM:SS",
+	// UTC); comparing in that exact shape keeps the comparison textual and
+	// index-free on both sides.
+	want := t.UTC().Format("2006-01-02 15:04:05")
+	var loID, hiID int64
+	err := s.reader.QueryRow(`SELECT COALESCE(MIN(id),0), COALESCE(MAX(id),0) FROM events`).Scan(&loID, &hiID)
+	if err != nil {
+		return 0, false, err
+	}
+	if hiID == 0 {
+		return 0, false, nil
+	}
+	at := func(id int64) (int64, string, error) {
+		var gotID int64
+		var created string
+		err := s.reader.QueryRow(
+			`SELECT id, created_at FROM events WHERE id >= ? ORDER BY id LIMIT 1`, id,
+		).Scan(&gotID, &created)
+		return gotID, created, err
+	}
+	if _, created, err := at(hiID); err != nil || created < want {
+		return 0, false, err // the newest event still predates t
+	}
+	lo, hi := loID, hiID // invariant: answer is in (lo, hi] once at(lo) < want
+	if _, created, err := at(lo); err != nil {
+		return 0, false, err
+	} else if created >= want {
+		return lo, true, nil
+	}
+	for lo+1 < hi {
+		mid := lo + (hi-lo)/2
+		gotID, created, err := at(mid)
+		if err != nil {
+			return 0, false, err
+		}
+		if created >= want {
+			hi = gotID
+			if gotID < mid {
+				hi = mid
+			}
+		} else if gotID >= hi {
+			break // the probe skipped past hi through an id gap; hi stands
+		} else {
+			lo = gotID
+		}
+	}
+	return hi, true, nil
 }
 
 // SearchHit is a single session match from SearchSessions.
