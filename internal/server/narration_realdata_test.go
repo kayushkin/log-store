@@ -12,7 +12,7 @@ import (
 	"github.com/kayushkin/log-store/internal/store"
 )
 
-// Step-1 verification from dash docs/dashv2-turns-per-message.md, run against
+// Step-1 verification from dash docs/chat-turns-per-message.md, run against
 // the REAL event log rather than fixtures: for the measured turn
 // (turn_01M0TPBZVZBX02T…, session br_1787601675531668005), the materialized
 // model must (a) stamp messageId on every message-bearing entry, agreeing with

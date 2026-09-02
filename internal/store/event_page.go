@@ -6,7 +6,7 @@ import (
 )
 
 // EventRow is a single stored event with its row id and type, used by the
-// dashv2 turn-model materializer. Unlike ListEvents (which injects event_id
+// The chat page's turn-model materializer. Unlike ListEvents (which injects event_id
 // into the JSON body), this keeps the id separate so the materializer can set
 // Entry.eventId without re-parsing.
 type EventRow struct {

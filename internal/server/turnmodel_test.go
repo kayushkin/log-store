@@ -594,7 +594,7 @@ func harnessTextBlock(t *testing.T, id int64, ts time.Time, text string) store.E
 // A subagent session emits no result event of its own — that is the premise of the
 // subagent-settling design — so nothing ever supersedes its block text. Marking the
 // blocks superseded anyway left the collapsed view with nothing to show, and every
-// surface that renders it (the dashv2 timeline's subagent dropdown, chat-core's
+// surface that renders it (the chat page's timeline subagent dropdown, chat-core's
 // TranscriptBody) reported a session with real prose as empty. 1,445 subagent
 // sessions on this host were affected.
 func TestBuildTurnModel_BlocksStayVisibleWhenTurnHasNoResult(t *testing.T) {

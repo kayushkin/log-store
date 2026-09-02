@@ -786,7 +786,7 @@ func surfaceUnsupersededBlocks(turns []Turn, entries map[string]Entry, textBlock
 // and a reload (which renders !duplicate entries) disagree: 30 narration rows
 // live, zero after refresh. That live-vs-materialized divergence is the class
 // of bug the per-message design exists to end (dash
-// docs/dashv2-turns-per-message.md §2).
+// docs/chat-turns-per-message.md §2).
 //
 // The join is the canonical MessageID, built over the whole page rather than
 // per turn — message ids are globally unique, so the wider scope costs nothing

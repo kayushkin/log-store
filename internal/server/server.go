@@ -31,7 +31,7 @@ func New(s *store.Store, forwarder *ls.Forwarder) *Server {
 	// a caller cannot ask for the 10x payload by accident. See project.go.
 	srv.mux.HandleFunc("GET /api/v1/sessions/{id}/messages/raw", srv.handleMessagesRaw)
 	srv.mux.HandleFunc("GET /api/v1/sessions/{id}/history", srv.handleHistory)
-	// dashv2 additive endpoints — turn-model materialization + validators.
+	// chat-page endpoints — turn-model materialization + validators.
 	srv.mux.HandleFunc("GET /api/v1/sessions/validators", srv.handleValidators)
 	srv.mux.HandleFunc("GET /api/v1/sessions/bundle", srv.handleBundle)
 	srv.mux.HandleFunc("GET /api/v1/sessions/{id}/events", srv.handleEvents)
@@ -95,7 +95,7 @@ func (s *Server) handleIngestEvent(w http.ResponseWriter, r *http.Request) {
 //   - No `limit`/`before`: the legacy shape — a []MaterializedMessage array
 //     over the FULL event stream. Byte-for-byte the prior behavior; existing
 //     consumers (bridge-ui BridgeSessions) still work.
-//   - `limit` and/or `before` present: the dashv2 shape — a bounded, annotated
+//   - `limit` and/or `before` present: the chat-page shape — a bounded, annotated
 //     TurnModel ({ model }). Default returns the last `limit` turns; `before`
 //     pages older. NEVER unbounded (see store.maxEventsPerPage) — the legacy
 //     full-stream materialize is what produced 306MB/85s for one session.
