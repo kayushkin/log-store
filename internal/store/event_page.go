@@ -34,6 +34,12 @@ const maxEventsPerPage = 5000
 // primary key, which is already indexed — the same monotonic row id the
 // /events?after=N path uses.
 func (s *Store) EventPage(sessionID string, limitTurns int, before int64) ([]EventRow, bool, error) {
+	return s.eventPage(sessionID, limitTurns, before, maxEventsPerPage)
+}
+
+// eventPage is EventPage with the event cap as a parameter, so a test can reach
+// the cap with a handful of rows instead of five thousand.
+func (s *Store) eventPage(sessionID string, limitTurns int, before int64, cap int) ([]EventRow, bool, error) {
 	if limitTurns <= 0 {
 		limitTurns = 30
 	}
@@ -42,12 +48,31 @@ func (s *Store) EventPage(sessionID string, limitTurns int, before int64) ([]Eve
 	if err != nil {
 		return nil, false, err
 	}
-	floor, err := s.eventFloorStart(sessionID, maxEventsPerPage, before)
+	floor, err := s.eventFloorStart(sessionID, cap, before)
 	if err != nil {
 		return nil, false, err
 	}
 	if floor > start {
-		start = floor
+		// The cap is a count of rows and knows nothing about turns, so left alone it
+		// cuts wherever the arithmetic lands — inside a turn, and in the worst case
+		// between a prompt and its OTel echo (~20ms, a few rows apart). That worst
+		// case is not rare: the floor slides forward one row per event, so on a long
+		// live session it passes through EVERY prompt pair in turn, and a page fetched
+		// at that moment opens on the echo with the prompt itself just outside
+		// (observed live 2026-09-02, br_1788370653337509270, 6224 events). So the
+		// floor snaps UP to the first turn boundary at or past it: the page holds
+		// whole turns only, and a turn the cap would have cut in half is left out
+		// rather than served in pieces. Only a session whose newest turn alone
+		// exceeds the cap has no boundary to snap to, and then the raw floor stands.
+		snapped, err := s.turnBoundaryAtOrAfter(sessionID, floor, before)
+		if err != nil {
+			return nil, false, err
+		}
+		if snapped > 0 {
+			start = snapped
+		} else {
+			start = floor
+		}
 	}
 
 	q := `SELECT id, type, data FROM events WHERE session_id=? AND id >= ?`
@@ -96,12 +121,24 @@ func (s *Store) EventPage(sessionID string, limitTurns int, before int64) ([]Eve
 // `before` when before > 0). Returns 0 when the session has no user_message
 // boundaries at all, so the caller falls back to the event floor.
 func (s *Store) turnWindowStart(sessionID string, limitTurns int, before int64) (int64, error) {
-	q := `SELECT id FROM events WHERE session_id=? AND type='user_message'`
+	// ONE boundary per turn, not one per user_message row. A prompt is stored twice —
+	// the bridge's copy and Claude Code's OTel echo of it, ~20ms later, both
+	// type='user_message' and both carrying the same turn_id. Counting rows put a
+	// second boundary inside every turn, so a window of N "turns" covered N/2 real
+	// ones and its floor could land ON the echo: the page then opened with the echo
+	// as its only copy of the prompt, unpaired and primary, while the bridge's copy
+	// sat just outside the window. chat-core kept its own live copy of that prompt
+	// (the page never reported it) and ordered it after the page's entries, so the
+	// user saw their message once before the answer and once after (observed live
+	// 2026-09-02, br_1788370653337509270). The boundary is the FIRST row of each
+	// turn; a row with no turn_id is its own turn, which is what it always was.
+	q := `SELECT MIN(id) AS id FROM events WHERE session_id=? AND type='user_message'`
 	args := []any{sessionID}
 	if before > 0 {
 		q += ` AND id < ?`
 		args = append(args, before)
 	}
+	q += ` GROUP BY COALESCE(NULLIF(json_extract(data, '$.turn_id'), ''), CAST(id AS TEXT))`
 	q += ` ORDER BY id DESC LIMIT ?`
 	args = append(args, limitTurns)
 	rows, err := s.reader.Query(q, args...)
@@ -126,6 +163,32 @@ func (s *Store) turnWindowStart(sessionID string, limitTurns int, before int64) 
 	// ids are DESC; the oldest of the last `limitTurns` boundaries is the
 	// window start.
 	return ids[len(ids)-1], nil
+}
+
+// turnBoundaryAtOrAfter returns the smallest per-turn boundary (the first
+// user_message row of a turn, see turnWindowStart) whose id is >= floor and, when
+// before > 0, < before. Returns 0 when no whole turn starts in that range.
+func (s *Store) turnBoundaryAtOrAfter(sessionID string, floor, before int64) (int64, error) {
+	q := `SELECT MIN(id) AS id FROM events WHERE session_id=? AND type='user_message'`
+	args := []any{sessionID}
+	if before > 0 {
+		q += ` AND id < ?`
+		args = append(args, before)
+	}
+	q += ` GROUP BY COALESCE(NULLIF(json_extract(data, '$.turn_id'), ''), CAST(id AS TEXT))`
+	q += ` HAVING MIN(id) >= ? ORDER BY id ASC LIMIT 1`
+	args = append(args, floor)
+	var id sql.NullInt64
+	if err := s.reader.QueryRow(q, args...).Scan(&id); err != nil {
+		if err == sql.ErrNoRows {
+			return 0, nil
+		}
+		return 0, err
+	}
+	if !id.Valid {
+		return 0, nil
+	}
+	return id.Int64, nil
 }
 
 // eventFloorStart returns the row id of the cap-th newest event (older than
