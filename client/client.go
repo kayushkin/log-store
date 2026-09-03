@@ -27,7 +27,24 @@ func New(baseURL string) *Client {
 	}
 }
 
+// StatusError is log-store answering a request with an HTTP error status.
+// It is a distinct type so a caller can tell a request log-store REJECTED
+// (4xx — the same body re-sent is rejected the same way) from one it could
+// not SERVE (5xx — it answered, so it stored nothing, and a retry is safe).
+// A transport error, where nothing came back at all, is not a StatusError.
+type StatusError struct {
+	StatusCode int
+	Status     string
+	Body       string
+}
+
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("log-store error: %s - %s", e.Status, e.Body)
+}
+
 // PushEvent sends a single event to log-store. Returns the stored row ID.
+// An HTTP error status comes back as a *StatusError; a transport failure
+// (refused, reset, timed out) comes back wrapped from net/http.
 func (c *Client) PushEvent(ev msg.Event) (int64, error) {
 	data, err := json.Marshal(ev)
 	if err != nil {
@@ -46,7 +63,7 @@ func (c *Client) PushEvent(ev msg.Event) (int64, error) {
 
 	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(resp.Body)
-		return 0, fmt.Errorf("log-store error: %s - %s", resp.Status, string(body))
+		return 0, &StatusError{StatusCode: resp.StatusCode, Status: resp.Status, Body: string(body)}
 	}
 
 	var result struct {
