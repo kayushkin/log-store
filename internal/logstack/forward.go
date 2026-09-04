@@ -2,6 +2,7 @@ package logstack
 
 import (
 	"log"
+	"net/http"
 	"sync"
 	"time"
 
@@ -9,6 +10,15 @@ import (
 	logstackclient "github.com/kayushkin/logstack/client"
 	"github.com/kayushkin/logstack/models"
 )
+
+// repeatSummaryInterval is how long a still-failing forwarder stays quiet
+// after it has already announced. Failures inside the window are counted into
+// Health, not printed.
+const repeatSummaryInterval = 5 * time.Minute
+
+// preflightTimeout bounds the startup reachability probe. Short on purpose:
+// the probe must not delay log-store accepting events.
+const preflightTimeout = 5 * time.Second
 
 // ForwardingHealth is a point-in-time snapshot of how the forwarder is faring
 // against its configured logstack. It exists because a forwarder that fails
@@ -54,15 +64,21 @@ func (h ForwardingHealth) Degraded() bool {
 
 // Forwarder sends summarized stats to logstack on result events.
 type Forwarder struct {
-	client    *logstackclient.Client
-	targetURL string
+	client     *logstackclient.Client
+	targetURL  string
+	httpClient *http.Client
 
 	// inFlight tracks the goroutines Forward spawns so callers can wait for
 	// them. Forward is asynchronous by design — ingest must not block on
 	// logstack — which leaves no other way to observe that a send finished.
 	inFlight sync.WaitGroup
 
+	// now is injectable so the announce-on-a-timer rule can be tested without
+	// a real clock.
+	now func() time.Time
+
 	mu                  sync.Mutex
+	lastAnnouncedAt     time.Time
 	attempted           uint64
 	succeeded           uint64
 	failed              uint64
@@ -74,8 +90,38 @@ type Forwarder struct {
 
 func NewForwarder(logstackURL string) *Forwarder {
 	return &Forwarder{
-		client:    logstackclient.New(logstackURL),
-		targetURL: logstackURL,
+		client:     logstackclient.New(logstackURL),
+		targetURL:  logstackURL,
+		now:        time.Now,
+		httpClient: &http.Client{Timeout: preflightTimeout},
+	}
+}
+
+// Preflight probes the configured logstack once at startup and reports what it
+// found. It never blocks startup and never fails: forwarding is secondary to
+// log-store's own job of storing events, so an unreachable logstack must be
+// loud, not fatal.
+//
+// It answers at boot the question the per-result failures never did — is the
+// configured URL a logstack at all? The live misconfiguration was not a logstack
+// that had moved but a URL pointing at bookstack, which 404s every POST.
+func (f *Forwarder) Preflight() {
+	url := f.targetURL + "/api/v1/health"
+
+	resp, err := f.httpClient.Get(url)
+	if err != nil {
+		log.Printf("[logstack-forward] STARTUP CHECK FAILED: target=%s is unreachable (%v) — every result event will be dropped until this is fixed", f.targetURL, err)
+		return
+	}
+	defer resp.Body.Close()
+
+	switch {
+	case resp.StatusCode == http.StatusNotFound:
+		log.Printf("[logstack-forward] STARTUP CHECK FAILED: target=%s answered 404 to %s — LOG_STORE_LOGSTACK_URL does not point at a logstack; every result event will be dropped until this is fixed", f.targetURL, url)
+	case resp.StatusCode >= 400:
+		log.Printf("[logstack-forward] STARTUP CHECK FAILED: target=%s answered %s — every result event will be dropped until this is fixed", f.targetURL, resp.Status)
+	default:
+		log.Printf("[logstack-forward] startup check ok: target=%s", f.targetURL)
 	}
 }
 
@@ -89,7 +135,11 @@ func (f *Forwarder) Forward(ev msg.Event) {
 		defer f.inFlight.Done()
 		entry := buildLogEntry(ev)
 		if err := f.client.Log(entry); err != nil {
-			log.Printf("[logstack-forward] failed: %v", err)
+			// Deliberately no per-failure log line here. Failures are counted
+			// into Health and announced by recordFailure at the start of a run
+			// and once per repeatSummaryInterval thereafter. A line per result
+			// is what buried this: 8,088 identical 404s in the journal between
+			// 2026-09-02 and 2026-09-04, none of which named the target.
 			f.recordFailure(err)
 			return
 		}
@@ -141,21 +191,33 @@ func (f *Forwarder) Health() ForwardingHealth {
 
 func (f *Forwarder) recordFailure(err error) {
 	f.mu.Lock()
+	now := f.now()
 	f.attempted++
 	f.failed++
 	f.consecutiveFailures++
 	f.lastError = err.Error()
-	f.lastErrorAt = time.Now()
+	f.lastErrorAt = now
+
 	firstOfARun := f.consecutiveFailures == 1
+	// A run that is still failing resurfaces on a timer. Without this the
+	// failure is announced once and then never again, so a forwarder that has
+	// been dead for two days looks exactly like one that recovered.
+	dueForRollup := !firstOfARun && now.Sub(f.lastAnnouncedAt) >= repeatSummaryInterval
+	if firstOfARun || dueForRollup {
+		f.lastAnnouncedAt = now
+	}
+	sinceAnnounced := f.consecutiveFailures
 	f.mu.Unlock()
 
-	// The per-failure line above is one of hundreds of thousands of identical
-	// lines and reads as background noise. This one fires only when working
-	// forwarding stops working, so it is the line worth grepping for, and it
-	// names the target because a misconfigured URL is what it is most likely
-	// to be reporting.
-	if firstOfARun {
+	// These are the only lines forwarding failures write. The first fires when
+	// working forwarding stops working; the roll-up fires at most once per
+	// repeatSummaryInterval while it stays broken. Both name the target,
+	// because a misconfigured URL is what they are most likely reporting.
+	switch {
+	case firstOfARun:
 		log.Printf("[logstack-forward] STARTED FAILING: target=%s err=%v — every result event is now being dropped", f.targetURL, err)
+	case dueForRollup:
+		log.Printf("[logstack-forward] STILL FAILING: target=%s err=%v — %d consecutive results dropped so far", f.targetURL, err, sinceAnnounced)
 	}
 }
 

@@ -7,7 +7,11 @@ ExecStart=__HOME__/bin/log-store
 Restart=on-failure
 RestartSec=3
 Environment=LOG_STORE_LISTEN_ADDR=:8175
-Environment=LOG_STORE_LOGSTACK_URL=http://localhost:8081
+# logstack's CODE default is 8081, but the deployed logstack unit overrides
+# LOGSTACK_PORT to 8088 and 8081 belongs to bookstack. Pointing at 8081 sent
+# every result event to the book library, which 404s: 8,088 dropped forwards
+# between 2026-09-02 and 2026-09-04. Keep this in step with logstack.service.
+Environment=LOG_STORE_LOGSTACK_URL=http://localhost:8088
 
 [Install]
 WantedBy=default.target

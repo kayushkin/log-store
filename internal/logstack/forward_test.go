@@ -2,12 +2,14 @@ package logstack
 
 import (
 	"bytes"
+	"io"
 	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/kayushkin/llm-bridge/msg"
 )
@@ -197,6 +199,16 @@ func TestAnEventWithNoResultIsNotAForwardAttempt(t *testing.T) {
 // TestOnlyTheStartOfAFailureRunLogsTheEscalatedLine pins the reason the live
 // defect went unseen: the per-failure line fired 287,106 times and read as
 // background noise. The escalated line has to stay rare enough to be a signal.
+//
+// ⚠️ This test previously asserted the OPPOSITE of its last check — that the
+// per-failure line still fired once per result, "the existing loudness must not
+// be reduced". That was a scope guard: the pass that added the escalated line
+// chose to be purely additive. Card 0282145c then asked for the other half in
+// so many words — "stop failing quietly: ... should say so once, loudly, not
+// once per result forever" — so the per-result line is now gone and its absence
+// is what this test pins. The signal it carried is not lost: the target URL and
+// the error text moved into the escalated line, the count into Health, and a
+// still-broken forwarder resurfaces on repeatSummaryInterval.
 func TestOnlyTheStartOfAFailureRunLogsTheEscalatedLine(t *testing.T) {
 	var buf bytes.Buffer
 	log.SetOutput(&buf)
@@ -217,8 +229,12 @@ func TestOnlyTheStartOfAFailureRunLogsTheEscalatedLine(t *testing.T) {
 	if !strings.Contains(buf.String(), srv.URL) {
 		t.Fatalf("escalated line does not name the target URL; a misconfigured URL is what it most often reports\n%s", buf.String())
 	}
-	if n := strings.Count(buf.String(), "[logstack-forward] failed:"); n != 4 {
-		t.Fatalf("per-failure line logged %d times over 4 failures, want 4 — the existing loudness must not be reduced", n)
+	if n := strings.Count(buf.String(), "[logstack-forward] failed:"); n != 0 {
+		t.Fatalf("per-failure line logged %d times over 4 failures, want 0 — one line per dropped result is the noise that hid the outage", n)
+	}
+	// Four failures, one line. That ratio is the whole point.
+	if n := strings.Count(buf.String(), "\n"); n != 1 {
+		t.Fatalf("4 consecutive failures wrote %d log lines, want exactly 1\n%s", n, buf.String())
 	}
 }
 
@@ -257,4 +273,110 @@ func TestRecoveryIsLoggedWithTheSizeOfTheOutage(t *testing.T) {
 	if strings.Contains(buf.String(), "RECOVERED") {
 		t.Fatalf("a success that recovered nothing logged RECOVERED\n%s", buf.String())
 	}
+}
+
+// A forwarder that stays broken must resurface on a timer. Announcing once and
+// then going silent makes a two-day outage look identical to a recovery.
+func TestAStillFailingForwarderResurfacesOnTheTimer(t *testing.T) {
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	log.SetFlags(0)
+	t.Cleanup(func() { log.SetOutput(nil); log.SetFlags(log.LstdFlags) })
+
+	srv, _ := fakeLogstack(t, http.StatusNotFound)
+	f := NewForwarder(srv.URL)
+
+	clock := time.Date(2026, 9, 4, 20, 0, 0, 0, time.UTC)
+	f.now = func() time.Time { return clock }
+
+	for i := 0; i < 5; i++ {
+		f.Forward(resultEvent("s1"))
+		f.Wait()
+	}
+	if n := strings.Count(buf.String(), "STILL FAILING"); n != 0 {
+		t.Fatalf("roll-up fired %d times inside the window, want 0\n%s", n, buf.String())
+	}
+
+	clock = clock.Add(repeatSummaryInterval + time.Second)
+	f.Forward(resultEvent("s1"))
+	f.Wait()
+
+	if n := strings.Count(buf.String(), "STILL FAILING"); n != 1 {
+		t.Fatalf("roll-up fired %d times after the window, want 1\n%s", n, buf.String())
+	}
+	if !strings.Contains(buf.String(), "6 consecutive results dropped") {
+		t.Fatalf("roll-up must carry the running count\n%s", buf.String())
+	}
+	if !strings.Contains(buf.String(), srv.URL) {
+		t.Fatalf("roll-up must name the target\n%s", buf.String())
+	}
+}
+
+// The exact live misconfiguration: the URL answers, but it is not a logstack.
+// bookstack on :8081 returned 404 to every POST for days.
+func TestPreflightNamesAURLThatIsNotALogstack(t *testing.T) {
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	log.SetFlags(0)
+	t.Cleanup(func() { log.SetOutput(nil); log.SetFlags(log.LstdFlags) })
+
+	srv, _ := fakeLogstack(t, http.StatusNotFound)
+	NewForwarder(srv.URL).Preflight()
+
+	out := buf.String()
+	if !strings.Contains(out, "STARTUP CHECK FAILED") {
+		t.Fatalf("want a loud startup failure, got:\n%s", out)
+	}
+	if !strings.Contains(out, "does not point at a logstack") {
+		t.Fatalf("a 404 at startup should name the misconfiguration, got:\n%s", out)
+	}
+	if !strings.Contains(out, srv.URL) {
+		t.Fatalf("want the offending URL, got:\n%s", out)
+	}
+}
+
+func TestPreflightReportsAnUnreachableTarget(t *testing.T) {
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	log.SetFlags(0)
+	t.Cleanup(func() { log.SetOutput(nil); log.SetFlags(log.LstdFlags) })
+
+	// Port 1 is reserved and never listening.
+	NewForwarder("http://127.0.0.1:1").Preflight()
+
+	out := buf.String()
+	if !strings.Contains(out, "STARTUP CHECK FAILED") || !strings.Contains(out, "unreachable") {
+		t.Fatalf("want a loud unreachable report, got:\n%s", out)
+	}
+}
+
+func TestPreflightIsHappyAgainstARealLogstack(t *testing.T) {
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	log.SetFlags(0)
+	t.Cleanup(func() { log.SetOutput(nil); log.SetFlags(log.LstdFlags) })
+
+	var probed string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		probed = r.URL.Path
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	NewForwarder(srv.URL).Preflight()
+
+	if probed != "/api/v1/health" {
+		t.Fatalf("preflight probed %q, want /api/v1/health", probed)
+	}
+	if !strings.Contains(buf.String(), "startup check ok") {
+		t.Fatalf("want the ok line, got:\n%s", buf.String())
+	}
+}
+
+// Preflight must never take log-store down: storing events is the primary job
+// and forwarding is secondary to it.
+func TestPreflightSurvivesAnUnparseableURL(t *testing.T) {
+	log.SetOutput(io.Discard)
+	t.Cleanup(func() { log.SetOutput(nil) })
+	NewForwarder("://not a url").Preflight()
 }
