@@ -102,6 +102,15 @@ All configuration is via environment variables.
 | `LOG_STORE_DB_PATH` | `~/.config/log-store/events.db` | SQLite database path |
 | `LOG_STORE_LOGSTACK_URL` | `http://localhost:8081` | Logstack URL for forwarding result statistics |
 
+> ⚠️ **The default matches logstack's *code* default, not necessarily your deployment.**
+> logstack reads `LOGSTACK_PORT` and defaults it to `8081`; if your logstack unit
+> overrides that port, `LOG_STORE_LOGSTACK_URL` must be overridden to match. On this
+> host logstack runs on `8088` and `8081` belongs to bookstack, so the default pointed
+> log-store at the wrong service entirely — 8,088 result events were POSTed to the book
+> library and 404'd away between 2026-09-02 and 2026-09-04. `log-store.service` now
+> sets `8088` explicitly. Startup runs a preflight probe that says so loudly if the
+> configured URL is not a logstack.
+
 ## Storage
 
 Events are stored in a single SQLite table with WAL mode and a 5-second busy timeout:
