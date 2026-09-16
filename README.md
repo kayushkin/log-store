@@ -80,7 +80,7 @@ curl 'http://localhost:8175/api/v1/sessions/abc123/events?after=42'
 | `GET` | `/api/v1/sessions/{id}/events?after=N&types=` | Raw events with row id > N, `event_id` spliced in |
 | `GET` | `/api/v1/sessions/{id}/turn-state` | Whether a turn is in flight |
 | `GET` | `/api/v1/sessions/search?q=` | Sessions whose events contain `q` |
-| `GET` | `/api/v1/sessions/aggregates` | Per-session token and cost totals |
+| `GET` | `/api/v1/sessions/aggregates` | Per-session token, turn and duration totals. No cost: a session's cost is llm-bridge-server's `spend_usd` / the `session_cost` event |
 | `GET` | `/api/v1/sessions/by-harness-id?harness_session_id=` | Sessions holding a harness session id |
 | `GET` | `/health` | `{"status": "ok"}` plus forwarder state |
 
