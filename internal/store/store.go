@@ -121,7 +121,6 @@ func (s *Store) migrate() error {
 			turn_count    INTEGER NOT NULL DEFAULT 0,
 			input_tokens  INTEGER NOT NULL DEFAULT 0,
 			output_tokens INTEGER NOT NULL DEFAULT 0,
-			cost_usd      REAL    NOT NULL DEFAULT 0,
 			duration_ms   INTEGER NOT NULL DEFAULT 0,
 			model         TEXT    NOT NULL DEFAULT '',
 			started_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -138,19 +137,21 @@ func (s *Store) migrate() error {
 	if _, err := s.writer.Exec(turnIndexMigration); err != nil {
 		return fmt.Errorf("create turn index tables: %w", err)
 	}
+	if err := s.dropSessionsCostColumn(); err != nil {
+		return err
+	}
 	// Backfill from events for any session not already projected. Runs once
 	// per session — guarded by NOT IN to skip already-populated sessions.
 	if _, err := s.writer.Exec(`
 		INSERT INTO sessions (
 			session_id, turn_count, input_tokens, output_tokens,
-			cost_usd, duration_ms, model, started_at, last_active, ended_at
+			duration_ms, model, started_at, last_active, ended_at
 		)
 		SELECT
 			e.session_id,
 			COALESCE(SUM(CASE WHEN e.type = 'user_message' THEN 1 ELSE 0 END), 0)               AS turn_count,
 			COALESCE(SUM(CASE WHEN e.type = 'result' THEN json_extract(e.data, '$.result.usage.input_tokens') ELSE 0 END), 0)  AS input_tokens,
 			COALESCE(SUM(CASE WHEN e.type = 'result' THEN json_extract(e.data, '$.result.usage.output_tokens') ELSE 0 END), 0) AS output_tokens,
-			COALESCE(SUM(CASE WHEN e.type = 'result' THEN json_extract(e.data, '$.result.cost.total_usd') ELSE 0 END), 0)      AS cost_usd,
 			COALESCE(SUM(CASE WHEN e.type = 'result' THEN json_extract(e.data, '$.result.duration_ms') ELSE 0 END), 0)         AS duration_ms,
 			COALESCE((
 				SELECT json_extract(e2.data, '$.result.model')
@@ -171,6 +172,27 @@ func (s *Store) migrate() error {
 		GROUP BY e.session_id
 	`); err != nil {
 		return fmt.Errorf("backfill sessions projection: %w", err)
+	}
+	return nil
+}
+
+// dropSessionsCostColumn removes the sessions projection's cost_usd.
+//
+// It summed result.cost.total_usd per turn, and Claude Code reports that figure
+// cumulatively for its CLI process, so it counted the same spending again every
+// turn: $267.71 for a session whose calls cost $97.60 (measured 2026-09-16). A
+// session's cost is llm-bridge-server's estimate (sessions.spend_usd there, the
+// session_cost event here); this store keeps no second, wrong one.
+func (s *Store) dropSessionsCostColumn() error {
+	var present int
+	if err := s.writer.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name='cost_usd'`).Scan(&present); err != nil {
+		return fmt.Errorf("inspect sessions columns: %w", err)
+	}
+	if present == 0 {
+		return nil
+	}
+	if _, err := s.writer.Exec(`ALTER TABLE sessions DROP COLUMN cost_usd`); err != nil {
+		return fmt.Errorf("drop sessions.cost_usd: %w", err)
 	}
 	return nil
 }
@@ -327,9 +349,6 @@ func (s *Store) updateSessionProjection(sessionID, eventType string, data []byte
 					InputTokens  int64 `json:"input_tokens"`
 					OutputTokens int64 `json:"output_tokens"`
 				} `json:"usage"`
-				Cost struct {
-					TotalUSD float64 `json:"total_usd"`
-				} `json:"cost"`
 				DurationMS int64  `json:"duration_ms"`
 				Model      string `json:"model"`
 			} `json:"result"`
@@ -348,14 +367,12 @@ func (s *Store) updateSessionProjection(sessionID, eventType string, data []byte
 			`UPDATE sessions SET
 				input_tokens = input_tokens + ?,
 				output_tokens = output_tokens + ?,
-				cost_usd = cost_usd + ?,
 				duration_ms = duration_ms + ?,
 				model = CASE WHEN ? != '' THEN ? ELSE model END,
 				ended_at = CURRENT_TIMESTAMP
 			WHERE session_id = ?`,
 			ev.Result.Usage.InputTokens,
 			ev.Result.Usage.OutputTokens,
-			ev.Result.Cost.TotalUSD,
 			ev.Result.DurationMS,
 			ev.Result.Model, ev.Result.Model,
 			sessionID,
@@ -685,7 +702,6 @@ type SessionAggregateRow struct {
 	Turns        int
 	InputTokens  int64
 	OutputTokens int64
-	CostUSD      float64
 	DurationMS   int64
 	Model        string
 }
@@ -701,9 +717,9 @@ type SessionAggregateRow struct {
 func (s *Store) ListSessionAggregates() ([]SessionAggregateRow, error) {
 	rows, err := s.reader.Query(`
 		SELECT session_id, turn_count, input_tokens, output_tokens,
-		       cost_usd, duration_ms, model
+		       duration_ms, model
 		FROM sessions
-		WHERE input_tokens > 0 OR output_tokens > 0 OR cost_usd > 0
+		WHERE input_tokens > 0 OR output_tokens > 0
 	`)
 	if err != nil {
 		return nil, err
@@ -712,7 +728,7 @@ func (s *Store) ListSessionAggregates() ([]SessionAggregateRow, error) {
 	var out []SessionAggregateRow
 	for rows.Next() {
 		var r SessionAggregateRow
-		if err := rows.Scan(&r.SessionID, &r.Turns, &r.InputTokens, &r.OutputTokens, &r.CostUSD, &r.DurationMS, &r.Model); err != nil {
+		if err := rows.Scan(&r.SessionID, &r.Turns, &r.InputTokens, &r.OutputTokens, &r.DurationMS, &r.Model); err != nil {
 			return nil, err
 		}
 		out = append(out, r)

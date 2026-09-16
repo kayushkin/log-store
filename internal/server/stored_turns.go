@@ -32,7 +32,7 @@ import (
 // ⚠️ BUMP IT whenever turnmodel.go, project.go, dedup.go or this file changes what a built
 // turn contains. TestMaterializerVersionTracksTheRules fails until you do: it
 // fingerprints those files and compares against materializerRulesFingerprint.
-const materializerVersion = 1
+const materializerVersion = 2
 
 // toolPayloadPreviewBytes is the most of any one tool string a preview page carries.
 const toolPayloadPreviewBytes = 2048
@@ -118,7 +118,7 @@ func (s *Server) storedTail(sessionID string, limit int, before int64, mode payl
 // assembleStoredPage turns stored turn and entry rows into a projected TurnModel.
 func assembleStoredPage(model *TurnModel, window []store.StoredTurn, stored []store.StoredEntry) error {
 	var latest aggregateSources
-	var haveSpend, haveContext bool
+	var haveSpend, haveCost, haveContext bool
 	for _, turn := range window {
 		var t Turn
 		if err := json.Unmarshal([]byte(turn.TurnJSON), &t); err != nil {
@@ -147,6 +147,9 @@ func assembleStoredPage(model *TurnModel, window []store.StoredTurn, stored []st
 		if sources.Spend != nil && sources.SpendEventID > latest.SpendEventID {
 			latest.SpendEventID, latest.Spend, haveSpend = sources.SpendEventID, sources.Spend, true
 		}
+		if sources.Cost != nil && sources.CostEventID > latest.CostEventID {
+			latest.CostEventID, latest.Cost, haveCost = sources.CostEventID, sources.Cost, true
+		}
 		if sources.ContextEventID > latest.ContextEventID {
 			latest.ContextEventID, latest.ContextTokens, latest.ContextLimit = sources.ContextEventID, sources.ContextTokens, sources.ContextLimit
 			haveContext = true
@@ -162,7 +165,10 @@ func assembleStoredPage(model *TurnModel, window []store.StoredTurn, stored []st
 	if !haveSpend {
 		latest.Spend = nil
 	}
-	model.Aggregates = buildAggregates(latest.Spend, latest.ContextTokens, latest.ContextLimit, haveContext)
+	if !haveCost {
+		latest.Cost = nil
+	}
+	model.Aggregates = buildAggregates(latest.Spend, latest.Cost, latest.ContextTokens, latest.ContextLimit, haveContext)
 	return nil
 }
 

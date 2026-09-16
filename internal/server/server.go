@@ -471,8 +471,8 @@ func (s *Server) handleSessionsByHarnessID(w http.ResponseWriter, r *http.Reques
 	})
 }
 
-// handleAggregates returns per-session token/cost totals summed from the
-// stored result events.
+// handleAggregates returns per-session token and duration totals summed from the
+// stored result events. No cost: see msg.SessionAggregate.
 func (s *Server) handleAggregates(w http.ResponseWriter, r *http.Request) {
 	rows, err := s.store.ListSessionAggregates()
 	if err != nil {
@@ -486,7 +486,6 @@ func (s *Server) handleAggregates(w http.ResponseWriter, r *http.Request) {
 			Turns:        r.Turns,
 			InputTokens:  r.InputTokens,
 			OutputTokens: r.OutputTokens,
-			CostUSD:      r.CostUSD,
 			DurationMS:   r.DurationMS,
 			Model:        r.Model,
 		})

@@ -371,6 +371,10 @@ func buildTurnModel(sessionID string, rows []store.EventRow, more bool) TurnMode
 type aggregateSources struct {
 	SpendEventID   int64                   `json:"spendEventId,omitempty"`
 	Spend          *msg.APISpendTotalEvent `json:"spend,omitempty"`
+	// CostEventID and Cost are the latest session_cost: the session's cost
+	// estimate, which is what totalUsd shows whenever the page holds one.
+	CostEventID int64                 `json:"costEventId,omitempty"`
+	Cost        *msg.SessionCostEvent `json:"cost,omitempty"`
 	ContextEventID int64                   `json:"contextEventId,omitempty"`
 	ContextTokens  int                     `json:"contextTokens,omitempty"`
 	ContextLimit   int                     `json:"contextLimit,omitempty"`
@@ -404,6 +408,7 @@ func buildTurnModelWithAggregateSources(sessionID string, rows []store.EventRow,
 	// stay nil/zero and the client falls back to its live-tail values. Rows are
 	// iterated in eventId-ASC order, so a later assignment is the LATEST value.
 	var latestSpend *msg.APISpendTotalEvent
+	var latestCost *msg.SessionCostEvent
 	var ctxTokens, ctxLimit int
 	var haveContext bool
 
@@ -503,6 +508,10 @@ func buildTurnModelWithAggregateSources(sessionID string, rows []store.EventRow,
 			latestSpend = ev.APISpendTotal
 			sources.SpendEventID, sources.Spend = r.ID, ev.APISpendTotal
 		}
+		if ev.Type == msg.EventSessionCost && ev.SessionCost != nil {
+			latestCost = ev.SessionCost
+			sources.CostEventID, sources.Cost = r.ID, ev.SessionCost
+		}
 		if tks, lim, ok := contextFromEvent(&ev); ok {
 			ctxTokens, ctxLimit, haveContext = tks, lim, true
 			sources.ContextEventID, sources.ContextTokens, sources.ContextLimit = r.ID, tks, lim
@@ -584,7 +593,7 @@ func buildTurnModelWithAggregateSources(sessionID string, rows []store.EventRow,
 		Entries:    entries,
 		Validator:  validator,
 		More:       more,
-		Aggregates: buildAggregates(latestSpend, ctxTokens, ctxLimit, haveContext),
+		Aggregates: buildAggregates(latestSpend, latestCost, ctxTokens, ctxLimit, haveContext),
 	}, sources
 }
 
@@ -645,8 +654,14 @@ func contextFromEvent(ev *msg.Event) (tokens, limit int, ok bool) {
 // present so the field is omitted (legacy/no-cost sessions unaffected). totalUsd
 // uses APISpendTotalEvent.TotalUSD, falling back to the sum of ByModel when the
 // total is zero but a per-model breakdown exists.
-func buildAggregates(spend *msg.APISpendTotalEvent, ctxTokens, ctxLimit int, haveContext bool) *TurnAggregates {
-	if spend == nil && !haveContext {
+//
+// totalUsd is the latest session_cost when the page holds one — the session's
+// cost estimate. A session recorded before session_cost existed (2026-09-16)
+// has none, and for those the API spend total was the session's defined cost
+// when it ran, so it is shown. byModel and byQuerySource always come from the
+// API spend breakdown, the only per-model attribution there is.
+func buildAggregates(spend *msg.APISpendTotalEvent, cost *msg.SessionCostEvent, ctxTokens, ctxLimit int, haveContext bool) *TurnAggregates {
+	if spend == nil && cost == nil && !haveContext {
 		return nil
 	}
 	agg := &TurnAggregates{}
@@ -660,6 +675,9 @@ func buildAggregates(spend *msg.APISpendTotalEvent, ctxTokens, ctxLimit int, hav
 		agg.TotalUSD = total
 		agg.ByModel = spend.ByModel
 		agg.ByQuerySource = spend.ByQuerySource
+	}
+	if cost != nil {
+		agg.TotalUSD = cost.TotalUSD
 	}
 	if haveContext {
 		agg.ContextTokens = ctxTokens

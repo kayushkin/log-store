@@ -229,10 +229,6 @@ func TestSessionProjectionFromEvents(t *testing.T) {
 	if a.DurationMS != 2000 {
 		t.Errorf("DurationMS = %d, want 2000", a.DurationMS)
 	}
-	// cost_usd is float; allow tiny epsilon.
-	if a.CostUSD < 0.0499 || a.CostUSD > 0.0501 {
-		t.Errorf("CostUSD = %v, want ~0.05", a.CostUSD)
-	}
 	// Latest result's model wins.
 	if a.Model != "claude-sonnet" {
 		t.Errorf("Model = %q, want claude-sonnet (latest result)", a.Model)
@@ -776,5 +772,32 @@ func TestSessionsHoldingHarnessSessionIDFollowsTheLatestID(t *testing.T) {
 	}
 	if len(before) != 0 {
 		t.Errorf("superseded id resolved to %+v, want nothing — the projection holds the latest", before)
+	}
+}
+
+
+// A database created before cost_usd was removed loses the column on the next
+// start, and its other totals survive.
+func TestMigrationDropsTheSessionsCostColumn(t *testing.T) {
+	s := newTestStore(t)
+	if _, err := s.StoreEvent("sess-old", "result", resultEvent(10, 5, 0.40, 100, "m")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.writer.Exec(`ALTER TABLE sessions ADD COLUMN cost_usd REAL NOT NULL DEFAULT 0`); err != nil {
+		t.Fatalf("recreate the old column: %v", err)
+	}
+	if err := s.migrate(); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	var present int
+	if err := s.reader.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name='cost_usd'`).Scan(&present); err != nil {
+		t.Fatal(err)
+	}
+	if present != 0 {
+		t.Fatal("sessions.cost_usd still present after migrate")
+	}
+	aggs, err := s.ListSessionAggregates()
+	if err != nil || len(aggs) != 1 || aggs[0].InputTokens != 10 {
+		t.Fatalf("aggregates after the drop: %+v %v", aggs, err)
 	}
 }

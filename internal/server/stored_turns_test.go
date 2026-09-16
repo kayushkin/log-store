@@ -272,8 +272,8 @@ func TestTurnMaterializer_BuildsTurnsWhenTheyEnd(t *testing.T) {
 // turn holds, bump materializerVersion in stored_turns.go so every stored turn is
 // rebuilt on its next read. Either way, then update both constants below.
 const (
-	fingerprintedMaterializerVersion = 1
-	materializerRulesFingerprint     = "dee3994be37cec9845240090bd5100cba6fe8303e970b9276407e88f84aba451"
+	fingerprintedMaterializerVersion = 2
+	materializerRulesFingerprint     = "7e620db615c56b35369982eb9a915ca125b2b8430eeeb7fdaed14a6de90d33a4"
 )
 
 func TestMaterializerVersionTracksTheRules(t *testing.T) {
@@ -298,4 +298,32 @@ func TestMaterializerVersionTracksTheRules(t *testing.T) {
 func itoa(n int64) string {
 	b, _ := json.Marshal(n)
 	return string(b)
+}
+
+// totalUsd is the session cost estimate when the page holds a session_cost, and
+// stays the API spend total for a session recorded before session_cost existed.
+func TestStoredTail_TotalUSDIsTheSessionCostEstimate(t *testing.T) {
+	srv, s := newTestServer(t)
+	ingestJSON(t, s, "costed", "user_message", map[string]any{"turn_id": "t", "result": map[string]any{"text": "go"}})
+	ingestJSON(t, s, "costed", "api_spend_total", map[string]any{"turn_id": "t", "api_spend_total": map[string]any{"total_usd": 1.00, "by_model": map[string]any{"m": 1.00}}})
+	ingestJSON(t, s, "costed", "session_cost", map[string]any{"turn_id": "t", "session_cost": map[string]any{"total_usd": 1.25, "api_spend_usd": 1.00, "turn_result_usd": 1.25}})
+	ingestJSON(t, s, "costed", "result", map[string]any{"turn_id": "t", "result": map[string]any{"text": "done"}})
+
+	page, err := srv.storedTail("costed", 30, 0, payloadPreview)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.Aggregates == nil || page.Aggregates.TotalUSD != 1.25 || page.Aggregates.ByModel["m"] != 1.00 {
+		t.Fatalf("aggregates = %+v; want totalUsd 1.25 from session_cost, byModel from api spend", page.Aggregates)
+	}
+
+	ingestJSON(t, s, "legacy", "user_message", map[string]any{"turn_id": "t", "result": map[string]any{"text": "go"}})
+	ingestJSON(t, s, "legacy", "api_spend_total", map[string]any{"turn_id": "t", "api_spend_total": map[string]any{"total_usd": 2.00}})
+	legacy, err := srv.storedTail("legacy", 30, 0, payloadPreview)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacy.Aggregates == nil || legacy.Aggregates.TotalUSD != 2.00 {
+		t.Fatalf("legacy aggregates = %+v; want the API spend total 2.00", legacy.Aggregates)
+	}
 }
