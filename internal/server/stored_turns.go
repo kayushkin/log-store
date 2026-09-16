@@ -17,8 +17,10 @@ import (
 // A page used to be built from raw events on every request. Now each turn is built
 // ONCE by the same builder (buildTurnModel + projectForReading), its output stored
 // in turns / turn_entries (store/turn_index.go), and a page is read back from those
-// rows. A turn is rebuilt only when it holds an event newer than its stored copy, or
-// when the rules changed (materializerVersion).
+// rows. A turn is rebuilt only when it holds an event newer than its stored copy,
+// when the rules changed (materializerVersion), or when a dual-emitted copy that
+// landed later — possibly in another turn — changed what its copies pair with
+// (dedup.go).
 //
 // There is one builder and one set of rules. The stored rows are its output, never a
 // second implementation of it, so a change to the rules reaches every page the
@@ -27,7 +29,7 @@ import (
 // materializerVersion names the rules the stored turns were built by. A turn stored
 // under any other version is rebuilt on its next read.
 //
-// ⚠️ BUMP IT whenever turnmodel.go, project.go or this file changes what a built
+// ⚠️ BUMP IT whenever turnmodel.go, project.go, dedup.go or this file changes what a built
 // turn contains. TestMaterializerVersionTracksTheRules fails until you do: it
 // fingerprints those files and compares against materializerRulesFingerprint.
 const materializerVersion = 1
@@ -71,11 +73,15 @@ func (s *Server) storedTail(sessionID string, limit int, before int64, mode payl
 
 	model := TurnModel{SessionID: sessionID, Turns: []Turn{}, Entries: map[string]Entry{}, More: more}
 	if len(window) > 0 {
+		pairing, err := s.sessionPairing(sessionID)
+		if err != nil {
+			return TurnModel{}, err
+		}
 		for i, turn := range window {
-			if !turn.NeedsMaterializing(materializerVersion) {
+			if !turn.NeedsMaterializing(materializerVersion, pairing.fingerprint(turn.Seq)) {
 				continue
 			}
-			built, err := s.materializeStoredTurn(sessionID, turn)
+			built, err := s.materializeStoredTurn(sessionID, turn, pairing)
 			if err != nil {
 				return TurnModel{}, err
 			}
@@ -160,8 +166,31 @@ func assembleStoredPage(model *TurnModel, window []store.StoredTurn, stored []st
 	return nil
 }
 
+// sessionPairing is a session's dual-emit pairs and which candidates sit in which
+// turn — what a turn is built with, and what says a stored turn's pairs moved.
+type sessionPairing struct {
+	pairs            dedupPairs
+	candidatesByTurn map[int64][]int64
+}
+
+func (p sessionPairing) fingerprint(turnSeq int64) string {
+	return pairsFingerprint(p.candidatesByTurn[turnSeq], p.pairs)
+}
+
+func (s *Server) sessionPairing(sessionID string) (sessionPairing, error) {
+	candidates, err := s.store.DedupCandidates(sessionID)
+	if err != nil {
+		return sessionPairing{}, fmt.Errorf("read dual-emit candidates of %s: %w", sessionID, err)
+	}
+	p := sessionPairing{pairs: pairDualEmits(candidates), candidatesByTurn: map[int64][]int64{}}
+	for _, c := range candidates {
+		p.candidatesByTurn[c.TurnSeq] = append(p.candidatesByTurn[c.TurnSeq], c.EventID)
+	}
+	return p, nil
+}
+
 // materializeStoredTurn builds one turn from its events and stores the result.
-func (s *Server) materializeStoredTurn(sessionID string, turn store.StoredTurn) (store.MaterializedTurn, error) {
+func (s *Server) materializeStoredTurn(sessionID string, turn store.StoredTurn, pairing sessionPairing) (store.MaterializedTurn, error) {
 	rows, err := s.store.TurnEvents(sessionID, turn)
 	if err != nil {
 		return store.MaterializedTurn{}, fmt.Errorf("read events of turn %d of %s: %w", turn.Seq, sessionID, err)
@@ -169,13 +198,13 @@ func (s *Server) materializeStoredTurn(sessionID string, turn store.StoredTurn) 
 	if len(rows) == 0 {
 		return store.MaterializedTurn{}, fmt.Errorf("turn %d of %s has no events", turn.Seq, sessionID)
 	}
-	full, sources := buildTurnModelWithAggregateSources(sessionID, rows, false)
+	full, sources := buildTurnModelWithAggregateSources(sessionID, rows, false, pairing.pairs)
 	projected := projectForReading(full)
 	if len(projected.Turns) != 1 {
 		return store.MaterializedTurn{}, fmt.Errorf("turn %d of %s built into %d turns, want 1", turn.Seq, sessionID, len(projected.Turns))
 	}
 
-	built := store.MaterializedTurn{Seq: turn.Seq, Version: materializerVersion}
+	built := store.MaterializedTurn{Seq: turn.Seq, Version: materializerVersion, DedupFingerprint: pairing.fingerprint(turn.Seq)}
 	for _, r := range rows {
 		if r.ID > built.ThroughEventID {
 			built.ThroughEventID = r.ID
@@ -339,8 +368,12 @@ func (s *Server) fullStoredEntry(sessionID string, eventID int64) (Entry, bool, 
 	if err != nil || !found {
 		return Entry{}, false, err
 	}
-	if turn.NeedsMaterializing(materializerVersion) {
-		if _, err := s.materializeStoredTurn(sessionID, turn); err != nil {
+	pairing, err := s.sessionPairing(sessionID)
+	if err != nil {
+		return Entry{}, false, err
+	}
+	if turn.NeedsMaterializing(materializerVersion, pairing.fingerprint(turn.Seq)) {
+		if _, err := s.materializeStoredTurn(sessionID, turn, pairing); err != nil {
 			return Entry{}, false, err
 		}
 	}
@@ -409,6 +442,28 @@ func (m *turnMaterializer) noteEvent(sessionID string, eventType msg.EventType) 
 // resumes from rebuilding its whole history here instead of page by page on read.
 const staleTurnsPerSession = 3
 
+// materializeNewestStaleTurns builds whichever of a session's `limit` newest turns
+// are stale.
+func (s *Server) materializeNewestStaleTurns(sessionID string, limit int) error {
+	turns, err := s.store.NewestTurns(sessionID, limit)
+	if err != nil {
+		return err
+	}
+	pairing, err := s.sessionPairing(sessionID)
+	if err != nil {
+		return err
+	}
+	for _, turn := range turns {
+		if !turn.NeedsMaterializing(materializerVersion, pairing.fingerprint(turn.Seq)) {
+			continue
+		}
+		if _, err := s.materializeStoredTurn(sessionID, turn, pairing); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (m *turnMaterializer) run() {
 	for range m.wake {
 		// Let the rest of a turn's closing events (result, usage, turn_complete)
@@ -427,15 +482,8 @@ func (m *turnMaterializer) run() {
 			if !current {
 				continue // the index backfill has not reached it; a read builds it on demand
 			}
-			stale, err := m.server.store.StoredTurnsNeedingMaterializing(sessionID, materializerVersion, staleTurnsPerSession)
-			if err != nil {
+			if err := m.server.materializeNewestStaleTurns(sessionID, staleTurnsPerSession); err != nil {
 				log.Printf("[log-store] turn materializer: %s: %v", sessionID, err)
-				continue
-			}
-			for _, turn := range stale {
-				if _, err := m.server.materializeStoredTurn(sessionID, turn); err != nil {
-					log.Printf("[log-store] turn materializer: %v", err)
-				}
 			}
 		}
 	}

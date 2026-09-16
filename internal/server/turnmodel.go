@@ -355,8 +355,11 @@ func entryText(ev *msg.Event) string {
 // buildTurnModel groups an ordered (by eventId ASC) slice of event rows into a
 // non-destructive, fully-annotated TurnModel. `more` is threaded through from
 // the pager (older turns remain beyond this page).
+//
+// Copies are paired within the page (pagePairs). The stored path builds with the
+// session's pairs instead — see buildTurnModelWithAggregateSources.
 func buildTurnModel(sessionID string, rows []store.EventRow, more bool) TurnModel {
-	model, _ := buildTurnModelWithAggregateSources(sessionID, rows, more)
+	model, _ := buildTurnModelWithAggregateSources(sessionID, rows, more, pagePairs(rows))
 	return model
 }
 
@@ -373,22 +376,17 @@ type aggregateSources struct {
 	ContextLimit   int                     `json:"contextLimit,omitempty"`
 }
 
-// buildTurnModelWithAggregateSources is buildTurnModel, also reporting where the
-// aggregates came from.
-func buildTurnModelWithAggregateSources(sessionID string, rows []store.EventRow, more bool) (TurnModel, aggregateSources) {
+// buildTurnModelWithAggregateSources is buildTurnModel with the dual-emit pairs
+// given rather than found in the rows, also reporting where the aggregates came
+// from. `pairs` may name twins outside `rows`: a copy paired with one is annotated
+// all the same, which is what lets a single turn be built correctly when its
+// twin landed in another.
+func buildTurnModelWithAggregateSources(sessionID string, rows []store.EventRow, more bool, pairs dedupPairs) (TurnModel, aggregateSources) {
 	var sources aggregateSources
 	entries := make(map[string]Entry, len(rows))
 	var order []string // entry ids in eventId order
 
 	// First pass: build one Entry per event, classified but not yet deduped.
-	type dedupKey struct {
-		class string // "user" | "assistant"
-		text  string
-	}
-	// For each dedup key, collect harness- and otel-sourced entry ids in
-	// eventId order so we can pair them count-wise (never positionally).
-	harnessByKey := map[dedupKey][]string{}
-	otelByKey := map[dedupKey][]string{}
 
 	// Entry ids of block echoes whose payload is a real TEXT block. Both a text
 	// and a thinking block classify to kind "text" (messageText falls through to
@@ -524,54 +522,19 @@ func buildTurnModelWithAggregateSources(sessionID string, rows []store.EventRow,
 		entries[id] = e
 		order = append(order, id)
 
-		// Register dedup-eligible entries (user prompts + assistant results),
-		// keyed by exact text, bucketed by source.
-		if conversation && (ev.Type == msg.EventUserMessage || ev.Type == msg.EventResult) {
-			t := entryText(&ev)
-			if t != "" {
-				class := "assistant"
-				if ev.Type == msg.EventUserMessage {
-					class = "user"
-				}
-				k := dedupKey{class: class, text: t}
-				if source == sourceOTel {
-					otelByKey[k] = append(otelByKey[k], id)
-				} else {
-					harnessByKey[k] = append(harnessByKey[k], id)
-				}
+		// Annotate a dual-emitted copy that has a twin (dedup.go). The harness copy
+		// stays primary and names the group; the OTel copy is the hidden duplicate,
+		// still present for the raw Timeline. A copy with no twin keeps its default
+		// annotation and renders — a re-send, or a turn only OTel recorded.
+		if twin, paired := pairs[r.ID]; paired {
+			harnessID := r.ID
+			if source == sourceOTel {
+				harnessID = twin
 			}
-		}
-	}
-
-	// Second pass: pair OTel copies against harness copies count-wise. The i-th
-	// OTel copy of a given text is absorbed by the i-th harness copy — they share
-	// a groupId, the harness copy stays primary, the OTel copy is marked
-	// duplicate (hidden in the collapsed view, still present for raw Timeline).
-	// Surplus copies of EITHER source remain standalone and visible: a genuine
-	// re-send of identical text still shows twice (extra harness copy), and a
-	// PTY-only or stream-json-dropped turn whose only record is the OTel copy
-	// still renders (surplus OTel copy). This is the source+count model, never
-	// positional — the OTel exporter batches ~1s so its copy can land after the
-	// reply.
-	for k, hIDs := range harnessByKey {
-		oIDs := otelByKey[k]
-		n := len(hIDs)
-		if len(oIDs) < n {
-			n = len(oIDs)
-		}
-		for i := 0; i < n; i++ {
-			gid := "g_" + hIDs[i]
-			h := entries[hIDs[i]]
-			h.GroupID = gid
-			h.Primary = true
-			h.Duplicate = false
-			entries[hIDs[i]] = h
-
-			o := entries[oIDs[i]]
-			o.GroupID = gid
-			o.Primary = false
-			o.Duplicate = true
-			entries[oIDs[i]] = o
+			e.GroupID = fmt.Sprintf("g_e_%d", harnessID)
+			e.Primary = source != sourceOTel
+			e.Duplicate = source == sourceOTel
+			entries[id] = e
 		}
 	}
 

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"fmt"
 	"encoding/json"
 	"io"
 	"log"
@@ -22,6 +23,9 @@ type Server struct {
 }
 
 func New(s *store.Store, forwarder *ls.Forwarder) *Server {
+	// The turn index records dual-emit candidates by the rule in dedup.go. Set before
+	// anything is served, so no event is indexed without it.
+	s.SetDedupCandidates(dedupCandidateOf, dedupCandidateVersion)
 	srv := &Server{store: s, forwarder: forwarder, mux: http.NewServeMux()}
 	srv.materializer = newTurnMaterializer(srv)
 	srv.mux.HandleFunc("POST /api/v1/events", srv.handleIngestEvent)
@@ -212,7 +216,16 @@ func (s *Server) materializeTail(id string, limit int, before int64) (TurnModel,
 	if err != nil {
 		return TurnModel{}, err
 	}
-	model := buildTurnModel(id, rows, more)
+	// Paired across the whole session, as the stored page is, so a copy whose twin
+	// sits outside this page is still recognised.
+	if err := s.store.BuildTurnIndex(id); err != nil {
+		return TurnModel{}, fmt.Errorf("index turns of %s: %w", id, err)
+	}
+	pairing, err := s.sessionPairing(id)
+	if err != nil {
+		return TurnModel{}, err
+	}
+	model, _ := buildTurnModelWithAggregateSources(id, rows, more, pairing.pairs)
 	// Overlay the whole-session validator so the client can staleness-check the
 	// tail against a cheap /validators sweep (page-local counts are not
 	// comparable to the session-wide validator).

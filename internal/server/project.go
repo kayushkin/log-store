@@ -1,7 +1,5 @@
 package server
 
-import "sort"
-
 // Projection of a materialized TurnModel down to what a reader actually renders.
 //
 // WHY THIS EXISTS. Materialization is non-destructive by design (D9): every stored
@@ -48,20 +46,17 @@ type SourceGroups map[string][]string
 // be a trap for the next caller that does not.
 func projectForReading(m TurnModel) TurnModel {
 	// Built from EVERY entry, before any are dropped — that is the point of it.
+	//
+	// A group is a harness copy paired with its OTel twin (dedup.go), so it always has
+	// both sources — even when the twin sits in another turn or page and is not among
+	// these entries. Listing only the sources present here would tell the badge a
+	// paired message had one source whenever its twin landed across a boundary.
 	groups := SourceGroups{}
 	for _, e := range m.Entries {
 		if e.GroupID == "" {
 			continue
 		}
-		if !containsString(groups[e.GroupID], e.Source) {
-			groups[e.GroupID] = append(groups[e.GroupID], e.Source)
-		}
-	}
-
-	// Sorted, because the loop above walks a map: without this the same page listed a
-	// group's sources in a different order on each request.
-	for _, sources := range groups {
-		sort.Strings(sources)
+		groups[e.GroupID] = []string{sourceHarness, sourceOTel}
 	}
 
 	kept := make(map[string]Entry, len(m.Entries))

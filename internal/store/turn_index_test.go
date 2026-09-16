@@ -241,7 +241,8 @@ func TestTurnWindow_SessionWithoutPromptsPagesByTurnCount(t *testing.T) {
 	}
 }
 
-// A stored turn is stale when an event lands after what the builder read.
+// A stored turn is stale when an event lands after what the builder read, when it
+// was built by other rules, or when its dual-emit pairs moved.
 func TestStoredTurn_StaleAfterNewEvent(t *testing.T) {
 	s := newTestStore(t)
 	sess := "stale"
@@ -252,20 +253,30 @@ func TestStoredTurn_StaleAfterNewEvent(t *testing.T) {
 		t.Fatalf("TurnOfEvent: %v %v", found, err)
 	}
 	if err := s.ReplaceMaterializedTurn(sess, MaterializedTurn{
-		Seq: turn.Seq, Version: 7, ThroughEventID: last, TurnJSON: `{}`, AggregateSourcesJSON: `{}`,
+		Seq: turn.Seq, Version: 7, ThroughEventID: last, TurnJSON: `{}`, AggregateSourcesJSON: `{}`, DedupFingerprint: "f",
 		Entries: []StoredEntry{{EventID: last, EntryJSON: `{}`}},
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if stale, _ := s.StoredTurnsNeedingMaterializing(sess, 7, 5); len(stale) != 0 {
+	newest := func() StoredTurn {
+		turns, err := s.NewestTurns(sess, 1)
+		if err != nil || len(turns) != 1 {
+			t.Fatalf("NewestTurns: %v %v", turns, err)
+		}
+		return turns[0]
+	}
+	if newest().NeedsMaterializing(7, "f") {
 		t.Fatalf("freshly stored turn reported stale")
 	}
-	storeTurnEvent(t, s, sess, "turn_complete", "a")
-	if stale, _ := s.StoredTurnsNeedingMaterializing(sess, 7, 5); len(stale) != 1 {
-		t.Fatalf("turn with a newer event not reported stale")
+	if !newest().NeedsMaterializing(7, "g") {
+		t.Fatalf("turn whose pairs moved not reported stale")
 	}
-	if stale, _ := s.StoredTurnsNeedingMaterializing(sess, 8, 5); len(stale) != 1 {
+	if !newest().NeedsMaterializing(8, "f") {
 		t.Fatalf("turn built by other rules not reported stale")
+	}
+	storeTurnEvent(t, s, sess, "turn_complete", "a")
+	if !newest().NeedsMaterializing(7, "f") {
+		t.Fatalf("turn with a newer event not reported stale")
 	}
 }
 

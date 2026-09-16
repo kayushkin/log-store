@@ -43,6 +43,11 @@ type Store struct {
 	// turnIndexLocks keeps two builds of one session's turn index from running at
 	// once. See turn_index.go.
 	turnIndexLocks sessionLocks
+
+	// dedupCandidateOf and turnIndexVersion come from the server through
+	// SetDedupCandidates. See turn_index.go.
+	dedupCandidateOf DedupCandidateFunc
+	turnIndexVersion int
 }
 
 func New(dbPath string) (*Store, error) {
@@ -75,7 +80,7 @@ func New(dbPath string) (*Store, error) {
 	}
 	reader.SetMaxOpenConns(readerPoolSize)
 
-	s := &Store{writer: writer, reader: reader}
+	s := &Store{writer: writer, reader: reader, turnIndexVersion: turnIndexRulesVersion * 1000}
 	if err := s.migrate(); err != nil {
 		writer.Close()
 		reader.Close()
@@ -256,7 +261,7 @@ func (s *Store) StoreEvent(sessionID, eventType string, data []byte) (int64, err
 	if err != nil {
 		return 0, err
 	}
-	if err := indexEventInTx(tx, sessionID, id, eventType, data); err != nil {
+	if err := s.indexEventInTx(tx, sessionID, id, eventType, data); err != nil {
 		return 0, fmt.Errorf("index event in its turn: %w", err)
 	}
 	if err := tx.Commit(); err != nil {

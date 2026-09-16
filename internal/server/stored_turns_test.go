@@ -189,6 +189,41 @@ func TestStoredTail_PreviewShortensToolPayloadsAndEntryRouteExpandsThem(t *testi
 	}
 }
 
+// An OTel echo that carries a different turn_id than its prompt is still recognised
+// as the prompt's twin, and a prompt turn built before its echo arrived is rebuilt.
+func TestStoredTail_PairsAnEchoThatLandedInAnotherTurn(t *testing.T) {
+	srv, s := newTestServer(t)
+	prompt := ingestJSON(t, s, "echo", "user_message", map[string]any{"turn_id": "t1", "result": map[string]any{"text": "fix it"}})
+	ingestJSON(t, s, "echo", "result", map[string]any{"turn_id": "t1", "result": map[string]any{"text": "fixed"}})
+	if _, err := srv.storedTail("echo", 30, 0, payloadFull); err != nil { // builds t1 with no twin yet
+		t.Fatal(err)
+	}
+	echo := ingestJSON(t, s, "echo", "user_message", map[string]any{"turn_id": "echo-turn", "result": map[string]any{"text": "fix it"}, "extensions": map[string]any{"source": "otel"}})
+
+	page, err := srv.storedTail("echo", 30, 0, payloadFull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, shown := page.Entries["e_"+itoa(echo)]; shown {
+		t.Fatalf("the echo in another turn is shown as a second prompt")
+	}
+	p := page.Entries["e_"+itoa(prompt)]
+	if p.GroupID != "g_e_"+itoa(prompt) || !p.Primary {
+		t.Fatalf("prompt built before its echo arrived was not rebuilt: %+v", p)
+	}
+	if got := page.SourceGroups[p.GroupID]; len(got) != 2 {
+		t.Fatalf("source groups for the pair: %v", got)
+	}
+
+	raw, err := srv.materializeTail("echo", 30, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !raw.Entries["e_"+itoa(echo)].Duplicate {
+		t.Fatalf("raw page does not mark the echo as the duplicate")
+	}
+}
+
 // A turn read while it is still running is rebuilt when a later event lands in it.
 func TestStoredTail_RebuildsATurnThatGrew(t *testing.T) {
 	srv, s := newTestServer(t)
@@ -214,11 +249,15 @@ func TestTurnMaterializer_BuildsTurnsWhenTheyEnd(t *testing.T) {
 	srv.materializer.noteEvent("bg", "result")
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		stale, err := s.StoredTurnsNeedingMaterializing("bg", materializerVersion, 5)
+		turns, err := s.NewestTurns("bg", 5)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(stale) == 0 {
+		pairing, err := srv.sessionPairing("bg")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(turns) == 1 && !turns[0].NeedsMaterializing(materializerVersion, pairing.fingerprint(turns[0].Seq)) {
 			return
 		}
 		time.Sleep(50 * time.Millisecond)
@@ -234,12 +273,12 @@ func TestTurnMaterializer_BuildsTurnsWhenTheyEnd(t *testing.T) {
 // rebuilt on its next read. Either way, then update both constants below.
 const (
 	fingerprintedMaterializerVersion = 1
-	materializerRulesFingerprint     = "94b3cabcb52340b8f5b6a50ad329caaddbbdbb6b4648d0648453415c6c78394d"
+	materializerRulesFingerprint     = "dee3994be37cec9845240090bd5100cba6fe8303e970b9276407e88f84aba451"
 )
 
 func TestMaterializerVersionTracksTheRules(t *testing.T) {
 	h := sha256.New()
-	for _, name := range []string{"turnmodel.go", "project.go", "stored_turns.go"} {
+	for _, name := range []string{"turnmodel.go", "project.go", "stored_turns.go", "dedup.go"} {
 		b, err := os.ReadFile(name)
 		if err != nil {
 			t.Fatal(err)

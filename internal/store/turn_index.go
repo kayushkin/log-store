@@ -26,6 +26,10 @@ import (
 //	turns                one row per turn: its event range, whether it holds a
 //	                     prompt, and the stored builder output for it.
 //	turn_entries         the builder's projected entries for a turn, one row each.
+//	dedup_candidates     for each prompt or reply that may be a dual-emitted copy, the
+//	                     hash of what it pairs on and its source. The pairing itself
+//	                     is the server's (dedup.go); this table only keeps its inputs,
+//	                     so pairing a whole session reads a few lean rows.
 //
 // Turn assignment follows the builder's own rule (server.buildTurns): an event's
 // turn is its turn_id; an event without one belongs to the previous event's turn;
@@ -41,6 +45,7 @@ import (
 const turnIndexMigration = `
 	CREATE TABLE IF NOT EXISTS turn_index_sessions (
 		session_id               TEXT PRIMARY KEY,
+		index_version            INTEGER NOT NULL,
 		indexed_through_event_id INTEGER NOT NULL,
 		last_turn_id             TEXT NOT NULL,
 		next_turn_seq            INTEGER NOT NULL
@@ -67,6 +72,7 @@ const turnIndexMigration = `
 		turn_json                     TEXT    NOT NULL DEFAULT '',
 		source_groups_json            TEXT    NOT NULL DEFAULT '',
 		aggregate_sources_json        TEXT    NOT NULL DEFAULT '',
+		dedup_fingerprint             TEXT    NOT NULL DEFAULT '',
 		PRIMARY KEY (session_id, turn_seq)
 	) WITHOUT ROWID;
 	CREATE UNIQUE INDEX IF NOT EXISTS idx_turns_session_turn_id ON turns(session_id, turn_id);
@@ -79,7 +85,41 @@ const turnIndexMigration = `
 		entry_json TEXT    NOT NULL,
 		PRIMARY KEY (session_id, turn_seq, event_id)
 	) WITHOUT ROWID;
+
+	CREATE TABLE IF NOT EXISTS dedup_candidates (
+		event_id   INTEGER PRIMARY KEY,
+		session_id TEXT    NOT NULL,
+		turn_seq   INTEGER NOT NULL,
+		key_hash   TEXT    NOT NULL,
+		source     TEXT    NOT NULL
+	);
+	CREATE INDEX IF NOT EXISTS idx_dedup_candidates_session ON dedup_candidates(session_id, event_id);
 `
+
+// turnIndexRulesVersion names the turn assignment rule in this file. Bump it when
+// that rule changes: every session's index is then rebuilt, on its next read or by
+// the background pass.
+const turnIndexRulesVersion = 1
+
+// DedupCandidateFunc reports whether an event may be a dual-emitted copy, and if so
+// the hash of what it pairs on and its source. The server owns that rule; the store
+// only records its answers.
+type DedupCandidateFunc func(eventType string, data []byte) (keyHash, source string, ok bool, err error)
+
+// DedupCandidate is one stored candidate.
+type DedupCandidate struct {
+	EventID int64
+	TurnSeq int64
+	KeyHash string
+	Source  string
+}
+
+// SetDedupCandidates installs the server's candidate rule and its version. Until it
+// is set, no candidates are recorded; the server sets it before it serves anything.
+func (s *Store) SetDedupCandidates(fn DedupCandidateFunc, version int) {
+	s.dedupCandidateOf = fn
+	s.turnIndexVersion = turnIndexRulesVersion*1000 + version
+}
 
 // turnIndexChunk is how many events one indexing pass reads and writes at a time.
 // Each chunk is one write transaction, so it bounds how long indexing an old
@@ -142,13 +182,19 @@ type execer interface {
 // transaction that inserted it. It does nothing for a session whose index is not
 // current yet: that session's events are indexed in order by BuildTurnIndex, which
 // also picks up this one.
-func indexEventInTx(tx *sql.Tx, sessionID string, eventID int64, eventType string, data []byte) error {
+func (s *Store) indexEventInTx(tx *sql.Tx, sessionID string, eventID int64, eventType string, data []byte) error {
 	var st sessionTurnState
 	var indexedThrough int64
+	var version int
 	err := tx.QueryRow(
-		`SELECT indexed_through_event_id, last_turn_id, next_turn_seq FROM turn_index_sessions WHERE session_id=?`,
+		`SELECT index_version, indexed_through_event_id, last_turn_id, next_turn_seq FROM turn_index_sessions WHERE session_id=?`,
 		sessionID,
-	).Scan(&indexedThrough, &st.lastTurnID, &st.nextTurnSeq)
+	).Scan(&version, &indexedThrough, &st.lastTurnID, &st.nextTurnSeq)
+	if err == nil && version != s.turnIndexVersion {
+		// Built by other rules: BuildTurnIndex rebuilds the whole session, this event
+		// included.
+		return nil
+	}
 	if errors.Is(err, sql.ErrNoRows) {
 		// No index row. A session whose ONLY event is this one is brand new, and its
 		// index starts current right here. Any other session still has older events
@@ -164,8 +210,8 @@ func indexEventInTx(tx *sql.Tx, sessionID string, eventID int64, eventType strin
 		}
 		st = sessionTurnState{nextTurnSeq: 1}
 		if _, err := tx.Exec(
-			`INSERT INTO turn_index_sessions (session_id, indexed_through_event_id, last_turn_id, next_turn_seq) VALUES (?,0,'',1)`,
-			sessionID,
+			`INSERT INTO turn_index_sessions (session_id, index_version, indexed_through_event_id, last_turn_id, next_turn_seq) VALUES (?,?,0,'',1)`,
+			sessionID, s.turnIndexVersion,
 		); err != nil {
 			return fmt.Errorf("open turn index: %w", err)
 		}
@@ -177,7 +223,7 @@ func indexEventInTx(tx *sql.Tx, sessionID string, eventID int64, eventType strin
 	if err := json.Unmarshal(data, &fields); err != nil {
 		return fmt.Errorf("read turn_id from event %d: %w", eventID, err)
 	}
-	if err := writeEventTurn(tx, sessionID, &st, eventID, eventType, fields.TurnID); err != nil {
+	if err := s.writeEventTurn(tx, sessionID, &st, eventID, eventType, fields.TurnID, data); err != nil {
 		return err
 	}
 	_, err = tx.Exec(
@@ -187,8 +233,10 @@ func indexEventInTx(tx *sql.Tx, sessionID string, eventID int64, eventType strin
 	return err
 }
 
-// writeEventTurn assigns one event to its turn and writes event_turns and turns.
-func writeEventTurn(db execer, sessionID string, st *sessionTurnState, eventID int64, eventType, rawTurnID string) error {
+// writeEventTurn assigns one event to its turn and writes event_turns, turns and,
+// for a possible dual-emitted copy, dedup_candidates. `data` may be nil for event
+// types that are never candidates.
+func (s *Store) writeEventTurn(db execer, sessionID string, st *sessionTurnState, eventID int64, eventType, rawTurnID string, data []byte) error {
 	turnID := st.assignTurn(eventID, rawTurnID)
 	isPrompt := 0
 	if eventType == "user_message" {
@@ -224,6 +272,20 @@ func writeEventTurn(db execer, sessionID string, st *sessionTurnState, eventID i
 	); err != nil {
 		return fmt.Errorf("index event %d: %w", eventID, err)
 	}
+	if s.dedupCandidateOf != nil && data != nil {
+		keyHash, source, ok, err := s.dedupCandidateOf(eventType, data)
+		if err != nil {
+			return fmt.Errorf("dedup candidate of event %d: %w", eventID, err)
+		}
+		if ok {
+			if _, err := db.Exec(
+				`INSERT INTO dedup_candidates (event_id, session_id, turn_seq, key_hash, source) VALUES (?,?,?,?,?)`,
+				eventID, sessionID, turnSeq, keyHash, source,
+			); err != nil {
+				return fmt.Errorf("record dedup candidate %d: %w", eventID, err)
+			}
+		}
+	}
 	return nil
 }
 
@@ -231,7 +293,8 @@ func writeEventTurn(db execer, sessionID string, st *sessionTurnState, eventID i
 func (s *Store) TurnIndexCurrent(sessionID string) (bool, error) {
 	var exists bool
 	err := s.reader.QueryRow(
-		`SELECT EXISTS(SELECT 1 FROM turn_index_sessions WHERE session_id=?)`, sessionID,
+		`SELECT EXISTS(SELECT 1 FROM turn_index_sessions WHERE session_id=? AND index_version=?)`,
+		sessionID, s.turnIndexVersion,
 	).Scan(&exists)
 	return exists, err
 }
@@ -275,7 +338,7 @@ func (s *Store) BuildTurnIndex(sessionID string) error {
 			return err
 		}
 		for _, ev := range batch {
-			if err := writeEventTurn(tx, sessionID, &st, ev.id, ev.eventType, ev.turnID); err != nil {
+			if err := s.writeEventTurn(tx, sessionID, &st, ev.id, ev.eventType, ev.turnID, ev.data); err != nil {
 				tx.Rollback()
 				return err
 			}
@@ -297,7 +360,7 @@ func (s *Store) BuildTurnIndex(sessionID string) error {
 			return err
 		}
 		for _, ev := range batch {
-			if err := writeEventTurn(tx, sessionID, &st, ev.id, ev.eventType, ev.turnID); err != nil {
+			if err := s.writeEventTurn(tx, sessionID, &st, ev.id, ev.eventType, ev.turnID, ev.data); err != nil {
 				return err
 			}
 			through = ev.id
@@ -307,8 +370,8 @@ func (s *Store) BuildTurnIndex(sessionID string) error {
 		}
 	}
 	if _, err := tx.Exec(
-		`INSERT INTO turn_index_sessions (session_id, indexed_through_event_id, last_turn_id, next_turn_seq) VALUES (?,?,?,?)`,
-		sessionID, through, st.lastTurnID, st.nextTurnSeq,
+		`INSERT INTO turn_index_sessions (session_id, index_version, indexed_through_event_id, last_turn_id, next_turn_seq) VALUES (?,?,?,?,?)`,
+		sessionID, s.turnIndexVersion, through, st.lastTurnID, st.nextTurnSeq,
 	); err != nil {
 		return fmt.Errorf("mark turn index current: %w", err)
 	}
@@ -322,6 +385,8 @@ func (s *Store) deletePartialTurnIndex(sessionID string) error {
 	}
 	defer tx.Rollback()
 	for _, q := range []string{
+		`DELETE FROM turn_index_sessions WHERE session_id=?`,
+		`DELETE FROM dedup_candidates WHERE session_id=?`,
 		`DELETE FROM event_turns WHERE session_id=?`,
 		`DELETE FROM turn_entries WHERE session_id=?`,
 		`DELETE FROM turns WHERE session_id=?`,
@@ -337,6 +402,7 @@ type eventTurnRow struct {
 	id        int64
 	eventType string
 	turnID    string
+	data      []byte // only for the event types that can be dedup candidates
 }
 
 type querier interface {
@@ -348,7 +414,8 @@ type querier interface {
 // SQLite rather than copying 14 KB stream frames into Go to read one string.
 func readEventTurnFields(db querier, sessionID string, afterID int64, limit int) ([]eventTurnRow, error) {
 	rows, err := db.Query(
-		`SELECT id, type, COALESCE(json_extract(data, '$.turn_id'), '')
+		`SELECT id, type, COALESCE(json_extract(data, '$.turn_id'), ''),
+		        CASE WHEN type IN ('user_message', 'result') THEN data END
 		 FROM events WHERE session_id=? AND id > ? ORDER BY id LIMIT ?`,
 		sessionID, afterID, limit,
 	)
@@ -360,8 +427,12 @@ func readEventTurnFields(db querier, sessionID string, afterID int64, limit int)
 	for rows.Next() {
 		var r eventTurnRow
 		var turnID any
-		if err := rows.Scan(&r.id, &r.eventType, &turnID); err != nil {
+		var data sql.NullString
+		if err := rows.Scan(&r.id, &r.eventType, &turnID, &data); err != nil {
 			return nil, err
+		}
+		if data.Valid {
+			r.data = []byte(data.String)
 		}
 		// A turn_id that is not a JSON string is not a turn id the builder would
 		// read either (msg.Event.TurnID is a string), so it counts as absent.
@@ -378,9 +449,9 @@ func readEventTurnFields(db querier, sessionID string, afterID int64, limit int)
 func (s *Store) SessionsAwaitingTurnIndex(limit int) ([]string, error) {
 	rows, err := s.reader.Query(
 		`SELECT s.session_id FROM sessions s
-		 WHERE NOT EXISTS (SELECT 1 FROM turn_index_sessions t WHERE t.session_id = s.session_id)
+		 WHERE NOT EXISTS (SELECT 1 FROM turn_index_sessions t WHERE t.session_id = s.session_id AND t.index_version = ?)
 		 ORDER BY s.last_active DESC LIMIT ?`,
-		limit,
+		s.turnIndexVersion, limit,
 	)
 	if err != nil {
 		return nil, err
@@ -410,16 +481,20 @@ type StoredTurn struct {
 	TurnJSON                   string
 	SourceGroupsJSON           string
 	AggregateSourcesJSON       string
+	DedupFingerprint           string
 }
 
 // NeedsMaterializing reports whether the stored builder output is missing, was
-// built by different rules, or predates an event the turn now holds.
-func (t StoredTurn) NeedsMaterializing(version int) bool {
-	return t.MaterializerVersion != version || t.MaterializedThroughEventID < t.LastEventID
+// built by different rules, predates an event the turn now holds, or was built
+// with different dual-emit pairs than `dedupFingerprint`.
+func (t StoredTurn) NeedsMaterializing(version int, dedupFingerprint string) bool {
+	return t.MaterializerVersion != version || t.MaterializedThroughEventID < t.LastEventID ||
+		t.DedupFingerprint != dedupFingerprint
 }
 
 const storedTurnColumns = `turn_seq, turn_id, first_event_id, last_event_id, event_count, has_user_message,
-	materializer_version, materialized_through_event_id, turn_json, source_groups_json, aggregate_sources_json`
+	materializer_version, materialized_through_event_id, turn_json, source_groups_json, aggregate_sources_json,
+	dedup_fingerprint`
 
 func scanStoredTurns(rows *sql.Rows) ([]StoredTurn, error) {
 	defer rows.Close()
@@ -428,7 +503,8 @@ func scanStoredTurns(rows *sql.Rows) ([]StoredTurn, error) {
 		var t StoredTurn
 		var hasPrompt int
 		if err := rows.Scan(&t.Seq, &t.TurnID, &t.FirstEventID, &t.LastEventID, &t.EventCount, &hasPrompt,
-			&t.MaterializerVersion, &t.MaterializedThroughEventID, &t.TurnJSON, &t.SourceGroupsJSON, &t.AggregateSourcesJSON); err != nil {
+			&t.MaterializerVersion, &t.MaterializedThroughEventID, &t.TurnJSON, &t.SourceGroupsJSON, &t.AggregateSourcesJSON,
+			&t.DedupFingerprint); err != nil {
 			return nil, err
 		}
 		t.HasUserMessage = hasPrompt == 1
@@ -542,19 +618,37 @@ func (s *Store) TurnWindow(sessionID string, limitTurns int, beforeEventID int64
 	return turns, more, nil
 }
 
-// StoredTurnsNeedingMaterializing returns up to `limit` of a session's newest
-// turns whose stored builder output is missing or stale.
-func (s *Store) StoredTurnsNeedingMaterializing(sessionID string, version, limit int) ([]StoredTurn, error) {
+// NewestTurns returns up to `limit` of a session's newest turns, newest first.
+func (s *Store) NewestTurns(sessionID string, limit int) ([]StoredTurn, error) {
 	rows, err := s.reader.Query(
-		`SELECT `+storedTurnColumns+` FROM turns
-		 WHERE session_id=? AND (materializer_version != ? OR materialized_through_event_id < last_event_id)
-		 ORDER BY turn_seq DESC LIMIT ?`,
-		sessionID, version, limit,
+		`SELECT `+storedTurnColumns+` FROM turns WHERE session_id=? ORDER BY turn_seq DESC LIMIT ?`,
+		sessionID, limit,
 	)
 	if err != nil {
 		return nil, err
 	}
 	return scanStoredTurns(rows)
+}
+
+// DedupCandidates returns every dual-emit candidate of a session, in event order.
+func (s *Store) DedupCandidates(sessionID string) ([]DedupCandidate, error) {
+	rows, err := s.reader.Query(
+		`SELECT event_id, turn_seq, key_hash, source FROM dedup_candidates WHERE session_id=? ORDER BY event_id`,
+		sessionID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []DedupCandidate
+	for rows.Next() {
+		var c DedupCandidate
+		if err := rows.Scan(&c.EventID, &c.TurnSeq, &c.KeyHash, &c.Source); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
 }
 
 // TurnEvents returns every event of one turn in event order, each carrying the
@@ -596,6 +690,7 @@ type MaterializedTurn struct {
 	TurnJSON             string
 	SourceGroupsJSON     string
 	AggregateSourcesJSON string
+	DedupFingerprint     string
 	Entries              []StoredEntry
 }
 
@@ -622,8 +717,8 @@ func (s *Store) ReplaceMaterializedTurn(sessionID string, m MaterializedTurn) er
 	}
 	res, err := tx.Exec(
 		`UPDATE turns SET materializer_version=?, materialized_through_event_id=?, turn_json=?,
-		 source_groups_json=?, aggregate_sources_json=? WHERE session_id=? AND turn_seq=?`,
-		m.Version, m.ThroughEventID, m.TurnJSON, m.SourceGroupsJSON, m.AggregateSourcesJSON, sessionID, m.Seq,
+		 source_groups_json=?, aggregate_sources_json=?, dedup_fingerprint=? WHERE session_id=? AND turn_seq=?`,
+		m.Version, m.ThroughEventID, m.TurnJSON, m.SourceGroupsJSON, m.AggregateSourcesJSON, m.DedupFingerprint, sessionID, m.Seq,
 	)
 	if err != nil {
 		return fmt.Errorf("store turn: %w", err)
