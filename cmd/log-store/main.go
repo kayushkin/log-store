@@ -26,6 +26,15 @@ func main() {
 	forwarder.Preflight()
 	srv := server.New(s, forwarder)
 
+	// Index the turns of every session written before the turn index existed,
+	// newest first. Reads do not wait for it: a read that reaches an unindexed
+	// session indexes that one itself.
+	go func() {
+		if err := srv.BackfillTurnIndex(); err != nil {
+			log.Printf("[log-store] turn index backfill STOPPED: %v", err)
+		}
+	}()
+
 	log.Printf("[log-store] listening on %s (db: %s)", cfg.ListenAddr, cfg.DBPath)
 	if err := http.ListenAndServe(cfg.ListenAddr, srv); err != nil {
 		log.Fatalf("[log-store] server error: %v", err)

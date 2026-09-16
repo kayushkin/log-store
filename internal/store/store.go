@@ -39,6 +39,10 @@ type Store struct {
 	// not separate them — the effect sits inside the noise of a busy box.
 	// This is a correctness change, not a measured speedup.
 	reader *sql.DB
+
+	// turnIndexLocks keeps two builds of one session's turn index from running at
+	// once. See turn_index.go.
+	turnIndexLocks sessionLocks
 }
 
 func New(dbPath string) (*Store, error) {
@@ -125,6 +129,9 @@ func (s *Store) migrate() error {
 	}
 	if err := s.migrateHarnessSessionID(); err != nil {
 		return err
+	}
+	if _, err := s.writer.Exec(turnIndexMigration); err != nil {
+		return fmt.Errorf("create turn index tables: %w", err)
 	}
 	// Backfill from events for any session not already projected. Runs once
 	// per session — guarded by NOT IN to skip already-populated sessions.
@@ -231,14 +238,30 @@ func (s *Store) migrateHarnessSessionID() error {
 // next StoreEvent call rolls forward correctly, and on next boot migrate()
 // will not re-backfill an already-present row).
 func (s *Store) StoreEvent(sessionID, eventType string, data []byte) (int64, error) {
-	result, err := s.writer.Exec(
+	// The event and its place in the turn index are written together, so the index
+	// can never hold an event the table does not, or miss one it does.
+	tx, err := s.writer.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	result, err := tx.Exec(
 		`INSERT INTO events (session_id, type, data) VALUES (?,?,?)`,
 		sessionID, eventType, string(data),
 	)
 	if err != nil {
 		return 0, err
 	}
-	id, _ := result.LastInsertId()
+	id, err := result.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+	if err := indexEventInTx(tx, sessionID, id, eventType, data); err != nil {
+		return 0, fmt.Errorf("index event in its turn: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
 	if err := s.updateSessionProjection(sessionID, eventType, data); err != nil {
 		log.Printf("[log-store] update sessions projection for %s/%s: %v", sessionID, eventType, err)
 	}

@@ -117,6 +117,15 @@ type Entry struct {
 	// what THIS session did must leave those out.
 	HarnessParentID string `json:"harnessParentId,omitempty"`
 
+	// Tool payload previews. Set only on a page asked for with payload=preview
+	// (see stored_turns.go): ToolInput / ToolResult then hold a shortened copy, the
+	// *Truncated flag says a longer original exists, and *Bytes is the original's
+	// size. GET /api/v1/sessions/{id}/entries/{eventId} returns the full entry.
+	ToolInputBytes      int  `json:"toolInputBytes,omitempty"`
+	ToolInputTruncated  bool `json:"toolInputTruncated,omitempty"`
+	ToolResultBytes     int  `json:"toolResultBytes,omitempty"`
+	ToolResultTruncated bool `json:"toolResultTruncated,omitempty"`
+
 	Duplicate bool   `json:"duplicate"`
 	Primary   bool   `json:"primary"`
 	GroupID   string `json:"groupId,omitempty"`
@@ -347,6 +356,27 @@ func entryText(ev *msg.Event) string {
 // non-destructive, fully-annotated TurnModel. `more` is threaded through from
 // the pager (older turns remain beyond this page).
 func buildTurnModel(sessionID string, rows []store.EventRow, more bool) TurnModel {
+	model, _ := buildTurnModelWithAggregateSources(sessionID, rows, more)
+	return model
+}
+
+// aggregateSources is what a page's aggregates are computed from: the latest spend
+// total and the latest context reading among the events read, each with the id of
+// the event it came from. A stored turn keeps these so a page of stored turns can
+// pick the latest across its turns — the same last-value-wins buildTurnModel
+// applies over a page of events.
+type aggregateSources struct {
+	SpendEventID   int64                   `json:"spendEventId,omitempty"`
+	Spend          *msg.APISpendTotalEvent `json:"spend,omitempty"`
+	ContextEventID int64                   `json:"contextEventId,omitempty"`
+	ContextTokens  int                     `json:"contextTokens,omitempty"`
+	ContextLimit   int                     `json:"contextLimit,omitempty"`
+}
+
+// buildTurnModelWithAggregateSources is buildTurnModel, also reporting where the
+// aggregates came from.
+func buildTurnModelWithAggregateSources(sessionID string, rows []store.EventRow, more bool) (TurnModel, aggregateSources) {
+	var sources aggregateSources
 	entries := make(map[string]Entry, len(rows))
 	var order []string // entry ids in eventId order
 
@@ -389,7 +419,7 @@ func buildTurnModel(sessionID string, rows []store.EventRow, more bool) TurnMode
 			// raw Timeline can show it. Nothing is dropped.
 			id := fmt.Sprintf("e_%d", r.ID)
 			entries[id] = Entry{
-				ID: id, TurnID: "", Role: "system", Kind: "meta",
+				ID: id, TurnID: r.TurnID, Role: "system", Kind: "meta",
 				Source: sourceHarness, EventID: r.ID, Ts: "",
 				Raw: append(json.RawMessage(nil), r.Data...), Duplicate: true,
 			}
@@ -401,9 +431,14 @@ func buildTurnModel(sessionID string, rows []store.EventRow, more bool) TurnMode
 		source := eventSource(&ev)
 		id := fmt.Sprintf("e_%d", r.ID)
 
+		turnID := ev.TurnID
+		if r.TurnID != "" {
+			// The turn index already placed this event (store.EventRow.TurnID).
+			turnID = r.TurnID
+		}
 		e := Entry{
 			ID:      id,
-			TurnID:  ev.TurnID,
+			TurnID:  turnID,
 			Role:    role,
 			Kind:    kind,
 			Source:  source,
@@ -421,17 +456,16 @@ func buildTurnModel(sessionID string, rows []store.EventRow, more bool) TurnMode
 		case msg.EventToolCall:
 			if ev.ToolCall != nil {
 				e.ToolName = ev.ToolCall.Name
-				e.ToolInput = ev.ToolCall.Input
 				e.ToolID = ev.ToolCall.ToolID
 			}
 		case msg.EventToolResult:
 			if ev.ToolResult != nil {
 				e.ToolName = ev.ToolResult.Name
-				e.ToolResult = json.RawMessage(quoteJSON(ev.ToolResult.Output))
 				e.ToolID = ev.ToolResult.ToolID
 				e.ToolError = ev.ToolResult.IsError
 			}
 		}
+		e.ToolInput, e.ToolResult = toolPayloads(&ev)
 		// Kind-specific fields, mapped straight from the canonical event.
 		if ev.Type == msg.EventError && ev.Error != nil {
 			e.Code = ev.Error.Code
@@ -469,9 +503,11 @@ func buildTurnModel(sessionID string, rows []store.EventRow, more bool) TurnMode
 		// carrying context state gives contextTokens/contextLimit.
 		if ev.Type == msg.EventAPISpendTotal && ev.APISpendTotal != nil {
 			latestSpend = ev.APISpendTotal
+			sources.SpendEventID, sources.Spend = r.ID, ev.APISpendTotal
 		}
 		if tks, lim, ok := contextFromEvent(&ev); ok {
 			ctxTokens, ctxLimit, haveContext = tks, lim, true
+			sources.ContextEventID, sources.ContextTokens, sources.ContextLimit = r.ID, tks, lim
 		}
 
 		// Default annotation. Conversation atoms are shown (primary, not
@@ -586,7 +622,21 @@ func buildTurnModel(sessionID string, rows []store.EventRow, more bool) TurnMode
 		Validator:  validator,
 		More:       more,
 		Aggregates: buildAggregates(latestSpend, ctxTokens, ctxLimit, haveContext),
+	}, sources
+}
+
+// toolPayloads returns an event's tool input and tool output as an Entry carries
+// them. The one place that mapping is written: the builder and the stored path's
+// full-payload read both use it, so a stored preview always expands back to
+// exactly what the builder would have put there.
+func toolPayloads(ev *msg.Event) (input, result json.RawMessage) {
+	if ev.Type == msg.EventToolCall && ev.ToolCall != nil {
+		input = ev.ToolCall.Input
 	}
+	if ev.Type == msg.EventToolResult && ev.ToolResult != nil {
+		result = json.RawMessage(quoteJSON(ev.ToolResult.Output))
+	}
+	return input, result
 }
 
 // entryUsageFromTokens maps a canonical msg.TokenUsage to the wire EntryUsage,

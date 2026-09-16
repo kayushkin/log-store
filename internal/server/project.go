@@ -1,5 +1,7 @@
 package server
 
+import "sort"
+
 // Projection of a materialized TurnModel down to what a reader actually renders.
 //
 // WHY THIS EXISTS. Materialization is non-destructive by design (D9): every stored
@@ -54,6 +56,12 @@ func projectForReading(m TurnModel) TurnModel {
 		if !containsString(groups[e.GroupID], e.Source) {
 			groups[e.GroupID] = append(groups[e.GroupID], e.Source)
 		}
+	}
+
+	// Sorted, because the loop above walks a map: without this the same page listed a
+	// group's sources in a different order on each request.
+	for _, sources := range groups {
+		sort.Strings(sources)
 	}
 
 	kept := make(map[string]Entry, len(m.Entries))

@@ -15,13 +15,15 @@ import (
 )
 
 type Server struct {
-	store     *store.Store
-	forwarder *ls.Forwarder
-	mux       *http.ServeMux
+	store        *store.Store
+	forwarder    *ls.Forwarder
+	mux          *http.ServeMux
+	materializer *turnMaterializer
 }
 
 func New(s *store.Store, forwarder *ls.Forwarder) *Server {
 	srv := &Server{store: s, forwarder: forwarder, mux: http.NewServeMux()}
+	srv.materializer = newTurnMaterializer(srv)
 	srv.mux.HandleFunc("POST /api/v1/events", srv.handleIngestEvent)
 	srv.mux.HandleFunc("GET /api/v1/sessions/search", srv.handleSearch)
 	srv.mux.HandleFunc("GET /api/v1/sessions/aggregates", srv.handleAggregates)
@@ -31,6 +33,9 @@ func New(s *store.Store, forwarder *ls.Forwarder) *Server {
 	// a caller cannot ask for the 10x payload by accident. See project.go.
 	srv.mux.HandleFunc("GET /api/v1/sessions/{id}/messages/raw", srv.handleMessagesRaw)
 	srv.mux.HandleFunc("GET /api/v1/sessions/{id}/history", srv.handleHistory)
+	// One entry of the reading page with its full tool payloads — what a preview
+	// page (payload=preview) points at for a shortened tool input or output.
+	srv.mux.HandleFunc("GET /api/v1/sessions/{id}/entries/{eventId}", srv.handleEntry)
 	// chat-page endpoints — turn-model materialization + validators.
 	srv.mux.HandleFunc("GET /api/v1/sessions/validators", srv.handleValidators)
 	srv.mux.HandleFunc("GET /api/v1/sessions/bundle", srv.handleBundle)
@@ -77,6 +82,8 @@ func (s *Server) handleIngestEvent(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"store failed"}`, http.StatusInternalServerError)
 		return
 	}
+
+	s.materializer.noteEvent(storeID, ev.Type)
 
 	// Forward result events to logstack
 	if ev.Type == msg.EventResult && ev.Result != nil {
@@ -129,12 +136,39 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 			before = n
 		}
 	}
-	model, err := s.materializeTail(id, limit, before)
+	mode, err := parsePayloadMode(q.Get("payload"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	model, err := s.storedTail(id, limit, before, mode)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, MessagesResponse{Model: projectForReading(model)})
+	writeJSON(w, MessagesResponse{Model: model})
+}
+
+// handleEntry returns one entry of the reading page with its full tool payloads:
+// GET /api/v1/sessions/{id}/entries/{eventId}. 404 when the event is not an entry of
+// that page — it does not exist, or the projection hides it as a duplicate copy.
+func (s *Server) handleEntry(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	eventID, err := strconv.ParseInt(r.PathValue("eventId"), 10, 64)
+	if err != nil || eventID <= 0 {
+		http.Error(w, "eventId must be a positive integer", http.StatusBadRequest)
+		return
+	}
+	entry, found, err := s.fullStoredEntry(id, eventID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !found {
+		http.Error(w, "no such entry", http.StatusNotFound)
+		return
+	}
+	writeJSON(w, entry)
 }
 
 // handleMessagesRaw serves the UNPROJECTED turn model: every entry the window
@@ -222,18 +256,23 @@ func (s *Server) handleBundle(w http.ResponseWriter, r *http.Request) {
 			turns = n
 		}
 	}
+	mode, err := parsePayloadMode(r.URL.Query().Get("payload"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	out := make(map[string]TurnModel, len(ids))
 	for _, id := range ids {
-		model, err := s.materializeTail(id, turns, 0)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
 		// Projected for the same reason `/messages` is, and it matters more here: the
 		// bundle is the COLD-BOOT payload and it multiplies by the session count.
 		// Measured 2026-08-25, `recent-bundle?n=20&turns=30` was 29.1 MB in a single
 		// response before this.
-		out[id] = projectForReading(model)
+		model, err := s.storedTail(id, turns, 0, mode)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		out[id] = model
 	}
 	writeJSON(w, out)
 }

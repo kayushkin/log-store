@@ -13,6 +13,11 @@ type EventRow struct {
 	ID   int64
 	Type string
 	Data []byte
+
+	// TurnID, when set, is the turn the turn index assigned this event, and the
+	// builder groups by it instead of re-deriving one from the page. Empty on rows
+	// read by EventPage, where the builder applies the rule itself.
+	TurnID string
 }
 
 // maxEventsPerPage is an absolute safety cap on how many raw events a single
