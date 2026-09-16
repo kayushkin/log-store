@@ -36,7 +36,6 @@ func New(s *store.Store, forwarder *ls.Forwarder) *Server {
 	// than a query param on the line above so the two answers cache separately and
 	// a caller cannot ask for the 10x payload by accident. See project.go.
 	srv.mux.HandleFunc("GET /api/v1/sessions/{id}/messages/raw", srv.handleMessagesRaw)
-	srv.mux.HandleFunc("GET /api/v1/sessions/{id}/history", srv.handleHistory)
 	// One entry of the reading page with its full tool payloads — what a preview
 	// page (payload=preview) points at for a shortened tool input or output.
 	srv.mux.HandleFunc("GET /api/v1/sessions/{id}/entries/{eventId}", srv.handleEntry)
@@ -99,17 +98,14 @@ func (s *Server) handleIngestEvent(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]int64{"id": rowID})
 }
 
-// handleMessages returns materialized messages for a session.
+// handleMessages returns the reading page of a session: its newest `limit` turns,
+// or with `before` the turns older than the one holding that event, as a projected
+// TurnModel ({ model }) read from stored turns (stored_turns.go).
 //
-// Two shapes, selected additively by query params so existing callers are
-// unaffected:
-//   - No `limit`/`before`: the legacy shape — a []MaterializedMessage array
-//     over the FULL event stream. Byte-for-byte the prior behavior; existing
-//     consumers (bridge-ui BridgeSessions) still work.
-//   - `limit` and/or `before` present: the chat-page shape — a bounded, annotated
-//     TurnModel ({ model }). Default returns the last `limit` turns; `before`
-//     pages older. NEVER unbounded (see store.maxEventsPerPage) — the legacy
-//     full-stream materialize is what produced 306MB/85s for one session.
+// A request naming neither `limit` nor `before` is refused. It used to answer a
+// different shape — every event of the session materialized as a message array,
+// 306 MB and 85 s for one real session — and its last caller, the kanban
+// classifier, stopped using it on 2026-09-16.
 func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	q := r.URL.Query()
@@ -117,14 +113,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	beforeStr := q.Get("before")
 
 	if limitStr == "" && beforeStr == "" {
-		// Legacy path — unchanged.
-		rawEvents, err := s.store.ListEvents(id, nil)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		msgs := materializeMessages(rawEvents)
-		writeJSON(w, msgs)
+		http.Error(w, "limit or before is required: /messages serves a bounded page of turns", http.StatusBadRequest)
 		return
 	}
 
@@ -207,33 +196,70 @@ func (s *Server) handleMessagesRaw(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, MessagesResponse{Model: model})
 }
 
-// materializeTail assembles the bounded, annotated TurnModel for a session's
-// tail (or a page older than `before`). This is the settled-history dedup owner
-// (D4/D9): it groups events into turns and annotates duplicate/primary/source,
-// but emits every event in the window.
+// rawEventCap bounds the events one raw page may carry. The raw page ships every
+// event with its full source payload, so it is bounded by events as well as turns.
+const rawEventCap = 5000
+
+// materializeTail assembles the UNPROJECTED TurnModel for a session's newest turns
+// (or those older than the turn holding `before`): every event of those turns as an
+// entry, duplicates annotated rather than dropped, each with its raw source event.
+//
+// It chooses turns exactly as the reading page does (store.TurnWindow), so the two
+// views of one session agree on which turns a page holds and what each turn is
+// called. Whole older turns are left out while the page is over rawEventCap; a
+// newest turn that alone is over it is served as its newest rawEventCap events.
 func (s *Server) materializeTail(id string, limit int, before int64) (TurnModel, error) {
-	rows, more, err := s.store.EventPage(id, limit, before)
-	if err != nil {
-		return TurnModel{}, err
-	}
-	// Paired across the whole session, as the stored page is, so a copy whose twin
-	// sits outside this page is still recognised.
 	if err := s.store.BuildTurnIndex(id); err != nil {
 		return TurnModel{}, fmt.Errorf("index turns of %s: %w", id, err)
 	}
+	window, more, err := s.store.TurnWindow(id, limit, before)
+	if err != nil {
+		return TurnModel{}, fmt.Errorf("choose turns of %s: %w", id, err)
+	}
+
+	// Keep the newest turns that fit; the first turn that would overflow ends it.
+	first := len(window)
+	var events int64
+	for i := len(window) - 1; i >= 0; i-- {
+		if i < len(window)-1 && events+window[i].EventCount > rawEventCap {
+			more = true
+			break
+		}
+		events += window[i].EventCount
+		first = i
+	}
+	window = window[first:]
+
+	var rows []store.EventRow
+	for _, turn := range window {
+		var turnRows []store.EventRow
+		if turn.EventCount > rawEventCap {
+			turnRows, err = s.store.TurnEventsTail(id, turn, rawEventCap)
+			more = true
+		} else {
+			turnRows, err = s.store.TurnEvents(id, turn)
+		}
+		if err != nil {
+			return TurnModel{}, fmt.Errorf("read events of turn %d of %s: %w", turn.Seq, id, err)
+		}
+		rows = append(rows, turnRows...)
+	}
+
+	// Paired across the whole session, as the reading page is, so a copy whose twin
+	// sits outside this page is still recognised.
 	pairing, err := s.sessionPairing(id)
 	if err != nil {
 		return TurnModel{}, err
 	}
 	model, _ := buildTurnModelWithAggregateSources(id, rows, more, pairing.pairs)
-	// Overlay the whole-session validator so the client can staleness-check the
-	// tail against a cheap /validators sweep (page-local counts are not
-	// comparable to the session-wide validator).
-	if vs, verr := s.store.Validators([]string{id}); verr == nil {
-		if v, ok := vs[id]; ok {
-			model.Validator = toWireValidator(v)
-		}
+	if model.Turns == nil {
+		model.Turns = []Turn{}
 	}
+	validators, err := s.store.Validators([]string{id})
+	if err != nil {
+		return TurnModel{}, fmt.Errorf("validator for %s: %w", id, err)
+	}
+	model.Validator = toWireValidator(validators[id])
 	return model, nil
 }
 
@@ -312,21 +338,6 @@ func splitIDs(raw string) []string {
 		}
 	}
 	return out
-}
-
-// handleHistory returns raw stored events for a session, optionally filtered
-// by ?types=foo,bar.
-func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	events, err := s.store.ListEvents(id, parseTypes(r))
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	if events == nil {
-		events = []json.RawMessage{}
-	}
-	writeJSON(w, events)
 }
 
 // handleEvents returns events after a given row ID (for polling/reconnection),

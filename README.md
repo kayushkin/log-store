@@ -2,30 +2,29 @@
 
 Durable event log for the [llm-bridge](https://github.com/kayushkin/llm-bridge) ecosystem.
 
-Persists all `msg.Event` from agent sessions into SQLite and makes them queryable via HTTP. Reconstructs materialized conversation history on read. Forwards result statistics to [logstack](https://github.com/kayushkin/logstack) for analytics.
+Persists every `msg.Event` from agent sessions into SQLite, the only record of what
+happened. Each event is placed in its turn as it is stored, each turn's reading page
+is built once and stored, and pages are served from those rows. Forwards result
+statistics to [logstack](https://github.com/kayushkin/logstack).
 
 ```
-  ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┐
-    llm-bridge-server  (or any HTTP client)
-  └ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┬ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┘
-                            │ HTTP
-  ╔═════════════════════════╪═════════════════════════════╗
-  ║                    log-store                          ║
-  ║                         │                             ║
-  ║   POST /events ──── ingest + store                    ║
-  ║   GET  /messages ── materialized conversation         ║
-  ║   GET  /history ─── raw event timeline                ║
-  ║   GET  /events ──── paginated poll (after=N)          ║
-  ║                         │                             ║
-  ║   ┌─────────────────────▼───────────────────────┐     ║
-  ║   │              SQLite (WAL)                   │     ║
-  ║   │   events table indexed by session_id        │     ║
-  ║   └─────────────────────┬───────────────────────┘     ║
-  ║                         │ result events               ║
-  ║                         ▼                             ║
-  ║                    logstack                            ║
-  ║              (async stats forwarding)                  ║
-  ╚═══════════════════════════════════════════════════════╝
+  llm-bridge-server (or any HTTP client)
+            │ HTTP
+  ┌─────────▼──────────────────────────────────────────────────────┐
+  │ log-store                                                      │
+  │   POST /events ─────────── store event + place it in its turn  │
+  │   GET  /messages?limit= ── reading page, from stored turns     │
+  │   GET  /messages/raw ───── every event of those turns          │
+  │   GET  /entries/{id} ───── one entry with full tool payloads   │
+  │   GET  /events?after=N ─── raw events, oldest first            │
+  │            │                                                   │
+  │   SQLite (WAL): events (the record) + derived, rebuildable:    │
+  │   turn_index_sessions, event_turns, turns, turn_entries,       │
+  │   dedup_candidates, sessions (per-session totals)              │
+  └────────────┬───────────────────────────────────────────────────┘
+               │ result events
+               ▼
+            logstack
 ```
 
 ## Quick start
@@ -55,42 +54,45 @@ curl -X POST http://localhost:8175/api/v1/events \
   -d '{"session_id": "abc123", "type": "result", ...}'
 ```
 
-### Query messages
+### Read a session
 
 ```bash
-# Materialized conversation (grouped messages with metadata)
-curl http://localhost:8175/api/v1/sessions/abc123/messages
+# The newest 30 turns as a reading page; tool payloads shortened to 2 KB
+curl 'http://localhost:8175/api/v1/sessions/abc123/messages?limit=30&payload=preview'
 
-# Raw event timeline
-curl http://localhost:8175/api/v1/sessions/abc123/history
+# One entry with its tool input and output in full
+curl http://localhost:8175/api/v1/sessions/abc123/entries/4242
 
-# Paginated poll (events after row ID 42)
-curl http://localhost:8175/api/v1/sessions/abc123/events?after=42
+# Raw events, oldest first (after=0 for all of them)
+curl 'http://localhost:8175/api/v1/sessions/abc123/events?after=42'
 ```
 
 ## API
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `POST` | `/api/v1/events` | Ingest a `msg.Event`. Returns `{"id": <rowID>}` (201 Created) |
-| `GET` | `/api/v1/sessions/{id}/messages` | Materialized conversation — streaming text accumulated, tool calls matched with results, token/cost metadata |
-| `GET` | `/api/v1/sessions/{id}/history` | Raw stored events in chronological order |
-| `GET` | `/api/v1/sessions/{id}/events?after=N` | Events with row ID > N — for polling/reconnection without re-fetching |
-| `GET` | `/health` | `{"status": "ok"}` |
+| `POST` | `/api/v1/events` | Ingest a `msg.Event` (needs `bridge_session_id`). Returns `{"id": <rowID>}` (201) |
+| `GET` | `/api/v1/sessions/{id}/messages?limit=&before=&payload=` | The reading page: `{model}` with the newest `limit` prompt turns, or those older than the turn holding event `before`. Duplicates dropped, no `raw`. `payload=preview` shortens tool strings to 2 KB. **`limit` or `before` is required** (400 otherwise) |
+| `GET` | `/api/v1/sessions/{id}/messages/raw?limit=&before=` | Same turns, unprojected: every event as an entry with its `raw` source, duplicates annotated. At most 5,000 events: older turns are left out first |
+| `GET` | `/api/v1/sessions/{id}/entries/{eventId}` | One entry of the reading page with full tool payloads; 404 if the event is not one |
+| `GET` | `/api/v1/sessions/bundle?ids=&turns=&payload=` | Reading pages for several sessions |
+| `GET` | `/api/v1/sessions/validators?ids=` | `{maxEventId, eventCount, updatedAt}` per session, from the turn index |
+| `GET` | `/api/v1/sessions/{id}/events?after=N&types=` | Raw events with row id > N, `event_id` spliced in |
+| `GET` | `/api/v1/sessions/{id}/turn-state` | Whether a turn is in flight |
+| `GET` | `/api/v1/sessions/search?q=` | Sessions whose events contain `q` |
+| `GET` | `/api/v1/sessions/aggregates` | Per-session token and cost totals |
+| `GET` | `/api/v1/sessions/by-harness-id?harness_session_id=` | Sessions holding a harness session id |
+| `GET` | `/health` | `{"status": "ok"}` plus forwarder state |
 
-### Event ingestion
+### Stored turns
 
-`POST /api/v1/events` accepts any `msg.Event` with a non-empty `session_id`. The raw JSON body is stored verbatim — no re-serialization. If the event type is `result`, usage statistics (tokens, cost, duration, tool invocations) are forwarded to logstack asynchronously.
-
-### Message materialization
-
-`GET /api/v1/sessions/{id}/messages` reconstructs the conversation from raw events:
-
-- Streaming text deltas are accumulated into complete messages
-- Tool calls are matched with their results by `ToolID` (fallback to tool name)
-- Each message includes its contributing events, token counts, and cost
-
-This is the endpoint llm-bridge-server proxies for session message history.
+Pages are not rebuilt from events on each read. `internal/store/turn_index.go` places
+every event in its turn when it is stored; `internal/server/stored_turns.go` builds a
+turn once with the builder in `turnmodel.go`, stores the projected result, and rebuilds
+it only when the turn gains an event, a dual-emitted copy changes what it pairs with
+(`dedup.go`), or `materializerVersion` changes. Everything but `events` is derived and
+can be dropped and rebuilt; sessions written before the index are indexed in the
+background at startup, newest first.
 
 ## Configuration
 
@@ -113,19 +115,9 @@ All configuration is via environment variables.
 
 ## Storage
 
-Events are stored in a single SQLite table with WAL mode and a 5-second busy timeout:
-
-```sql
-CREATE TABLE events (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id TEXT NOT NULL,
-    type       TEXT NOT NULL,
-    data       TEXT NOT NULL,
-    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-```
-
-Indexed by `session_id` and `(session_id, type)`.
+`events` is the record: one row per event, stored verbatim, indexed by `session_id`
+and `(session_id, type)`. The other tables are derived from it — see
+[Stored turns](#stored-turns).
 
 ## Client library
 
@@ -140,4 +132,4 @@ id, err := c.PushEvent(event)
 
 ## Part of the llm-bridge ecosystem
 
-log-store is an optional store in the [llm-bridge](https://github.com/kayushkin/llm-bridge) ecosystem. llm-bridge-server proxies message and history endpoints to log-store when `LLMBRIDGE_LOG_STORE_URL` is configured. See the [llm-bridge README](https://github.com/kayushkin/llm-bridge) for the full picture.
+log-store is an optional store in the [llm-bridge](https://github.com/kayushkin/llm-bridge) ecosystem. llm-bridge-server proxies the messages, raw and entry endpoints to log-store when `LLMBRIDGE_LOG_STORE_URL` is configured. See the [llm-bridge README](https://github.com/kayushkin/llm-bridge) for the full picture.

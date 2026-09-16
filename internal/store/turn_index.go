@@ -518,7 +518,7 @@ func scanStoredTurns(rows *sql.Rows) ([]StoredTurn, error) {
 // turn order, and whether older turns remain.
 //
 // A page holds `limitTurns` prompts, counting a turn as a prompt boundary when it
-// holds a user_message, the same boundary EventPage counts. Turns without a prompt
+// holds a user_message. Turns without a prompt
 // ride along with the prompt turn before them. A session with no prompt turns at
 // all pages by plain turn count.
 //
@@ -658,6 +658,34 @@ func (s *Store) TurnEvents(sessionID string, turn StoredTurn) ([]EventRow, error
 		`SELECT e.id, e.type, e.data FROM event_turns t JOIN events e ON e.id = t.event_id
 		 WHERE t.session_id=? AND t.turn_seq=? ORDER BY t.event_id`,
 		sessionID, turn.Seq,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []EventRow
+	for rows.Next() {
+		r := EventRow{TurnID: turn.TurnID}
+		var data string
+		if err := rows.Scan(&r.ID, &r.Type, &data); err != nil {
+			return nil, err
+		}
+		r.Data = []byte(data)
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// TurnEventsTail is TurnEvents limited to the turn's newest `max` events, still in
+// event order. It exists for the raw page's one unbounded case: a single turn with
+// more events than a page may carry.
+func (s *Store) TurnEventsTail(sessionID string, turn StoredTurn, max int) ([]EventRow, error) {
+	rows, err := s.reader.Query(
+		`SELECT id, type, data FROM (
+			SELECT e.id, e.type, e.data FROM event_turns t JOIN events e ON e.id = t.event_id
+			WHERE t.session_id=? AND t.turn_seq=? ORDER BY t.event_id DESC LIMIT ?
+		) ORDER BY id`,
+		sessionID, turn.Seq, max,
 	)
 	if err != nil {
 		return nil, err

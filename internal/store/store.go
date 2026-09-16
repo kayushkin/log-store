@@ -371,39 +371,10 @@ func (s *Store) updateSessionProjection(sessionID, eventType string, data []byte
 	return nil
 }
 
-// ListEvents returns all stored events for a session, ordered chronologically.
-// Each event's JSON is decorated with an "event_id" field carrying the row ID,
-// so clients can track the high-water mark and dedup against SSE replay.
-// If types is non-empty, only events whose `type` is in the set are returned.
-func (s *Store) ListEvents(sessionID string, types []string) ([]json.RawMessage, error) {
-	q := `SELECT id, data FROM events WHERE session_id=?`
-	args := []any{sessionID}
-	if len(types) > 0 {
-		q += ` AND type IN (` + placeholders(len(types)) + `)`
-		for _, t := range types {
-			args = append(args, t)
-		}
-	}
-	q += ` ORDER BY id ASC`
-	rows, err := s.reader.Query(q, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var events []json.RawMessage
-	for rows.Next() {
-		var rowID int64
-		var data string
-		if err := rows.Scan(&rowID, &data); err != nil {
-			return nil, err
-		}
-		events = append(events, injectEventID([]byte(data), rowID))
-	}
-	return events, rows.Err()
-}
-
-// ListEventsSinceID returns events after a specific row ID. See ListEvents for
-// the event_id decoration.
+// ListEventsSinceID returns a session's events after a row ID (0 for all of them),
+// oldest first. Each event's JSON is decorated with an "event_id" field carrying
+// its row id, so a client can track the high-water mark and dedupe against a
+// stream replay. If types is non-empty, only events of those types are returned.
 func (s *Store) ListEventsSinceID(sessionID string, afterID int, types []string) ([]json.RawMessage, error) {
 	q := `SELECT id, data FROM events WHERE session_id=? AND id > ?`
 	args := []any{sessionID, afterID}

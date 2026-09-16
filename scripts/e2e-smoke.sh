@@ -4,7 +4,7 @@
 # Builds log-store from THIS checkout, boots it against a throwaway SQLite DB
 # on a throwaway port, drives a full session's worth of events through the real
 # HTTP API, and asserts the service reads back what was written — materialized
-# messages, raw history, turn state, search, and per-session aggregates. Then
+# the reading page of turns, raw events, turn state, search, and per-session aggregates. Then
 # restarts the binary against the same DB and re-asserts, so persistence and the
 # migrate()/backfill path are covered too.
 #
@@ -247,16 +247,16 @@ RESULT_EVENT_ID=$(jq -r '.id' <<<"$RESP")
 [ "$RESULT_EVENT_ID" -gt 0 ] 2>/dev/null || fail "result ingest did not return a row id: $RESP"
 echo "    result event_id: $RESULT_EVENT_ID (accepted despite unreachable logstack)"
 
-step "GET /api/v1/sessions/{id}/history — raw events, in order, event_id-stamped"
-HIST=$(get "/api/v1/sessions/$SID/history")
+step "GET /api/v1/sessions/{id}/events?after=0 — raw events, in order, event_id-stamped"
+HIST=$(get "/api/v1/sessions/$SID/events?after=0")
 eq "history length"      "$(jq -r 'length' <<<"$HIST")" "4"
 eq "history types"       "$(jq -r '[.[].type] | join(",")' <<<"$HIST")" "user_message,tool_call,tool_result,result"
 eq "event_id injected"   "$(jq -r '[.[] | select(.event_id != null)] | length' <<<"$HIST")" "4"
 eq "first event_id"      "$(jq -r '.[0].event_id' <<<"$HIST")" "$USER_EVENT_ID"
 eq "user text round-trip" "$(jq -r '.[0].result.text' <<<"$HIST")" "$USER_TEXT"
 
-step "GET /api/v1/sessions/{id}/history?types=result — server-side filter"
-FILTERED=$(get "/api/v1/sessions/$SID/history?types=result")
+step "GET /api/v1/sessions/{id}/events?after=0&types=result — server-side filter"
+FILTERED=$(get "/api/v1/sessions/$SID/events?after=0&types=result")
 eq "filtered length" "$(jq -r 'length' <<<"$FILTERED")" "1"
 eq "filtered type"   "$(jq -r '.[0].type' <<<"$FILTERED")" "result"
 eq "filtered model"  "$(jq -r '.[0].result.model' <<<"$FILTERED")" "$MODEL"
@@ -267,19 +267,17 @@ eq "tail length" "$(jq -r 'length' <<<"$TAIL")" "3"
 eq "tail types"  "$(jq -r '[.[].type] | join(",")' <<<"$TAIL")" "tool_call,tool_result,result"
 eq "tail after latest is empty" "$(jq -r 'length' <<<"$(get "/api/v1/sessions/$SID/events?after=$RESULT_EVENT_ID")")" "0"
 
-step "GET /api/v1/sessions/{id}/messages — materialized chat"
-MSGS=$(get "/api/v1/sessions/$SID/messages")
-eq "message count"      "$(jq -r 'length' <<<"$MSGS")" "2"
-eq "msg[0].role"        "$(jq -r '.[0].role' <<<"$MSGS")" "user"
-eq "msg[0].content"     "$(jq -r '.[0].content' <<<"$MSGS")" "$USER_TEXT"
-eq "msg[0].id"          "$(jq -r '.[0].id' <<<"$MSGS")" "$MSG_USER"
-eq "msg[1].role"        "$(jq -r '.[1].role' <<<"$MSGS")" "assistant"
-eq "msg[1].content"     "$(jq -r '.[1].content' <<<"$MSGS")" "$ASSISTANT_TEXT"
-eq "msg[1].done"        "$(jq -r '.[1].done' <<<"$MSGS")" "true"
-eq "msg[1].tools[0].tool"   "$(jq -r '.[1].tools[0].tool' <<<"$MSGS")" "Bash"
-eq "msg[1].tools[0].output" "$(jq -r '.[1].tools[0].output' <<<"$MSGS")" "4"
-eq "msg[1].meta.model"      "$(jq -r '.[1].meta.model' <<<"$MSGS")" "$MODEL"
-eq "msg[1].meta.usage.input_tokens" "$(jq -r '.[1].meta.usage.input_tokens' <<<"$MSGS")" "1234"
+step "GET /api/v1/sessions/{id}/messages?limit=30 — the reading page of turns"
+MSGS=$(get "/api/v1/sessions/$SID/messages?limit=30")
+eq "turn count"          "$(jq -r '.model.turns | length' <<<"$MSGS")" "1"
+eq "prompt text"         "$(jq -r '[.model.entries[] | select(.role=="user" and .kind=="text")][0].text' <<<"$MSGS")" "$USER_TEXT"
+eq "prompt message id"   "$(jq -r '[.model.entries[] | select(.role=="user" and .kind=="text")][0].messageId' <<<"$MSGS")" "$MSG_USER"
+eq "reply text"          "$(jq -r '[.model.entries[] | select(.kind=="result")][0].text' <<<"$MSGS")" "$ASSISTANT_TEXT"
+eq "tool call name"      "$(jq -r '[.model.entries[] | select(.kind=="tool_call")][0].toolName' <<<"$MSGS")" "Bash"
+eq "tool result output"  "$(jq -r '[.model.entries[] | select(.kind=="tool_result")][0].toolResult' <<<"$MSGS")" "4"
+eq "validator count"     "$(jq -r '.model.validator.eventCount' <<<"$MSGS")" "4"
+eq "no limit → 400" \
+   "$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' "$BASE/api/v1/sessions/$SID/messages")" "400"
 
 step "GET /api/v1/sessions/{id}/turn-state — turn closed"
 TS=$(get "/api/v1/sessions/$SID/turn-state")
@@ -339,7 +337,7 @@ eq "empty harness_session_id → 400" \
 step "POST /api/v1/events — malformed input is rejected, not stored"
 eq "missing bridge_session_id → 400" "$(status_of '{"type":"result","result":{"text":"orphan"}}')" "400"
 eq "invalid JSON → 400"              "$(status_of 'not json at all')" "400"
-eq "history unchanged after rejects" "$(jq -r 'length' <<<"$(get "/api/v1/sessions/$SID/history")")" "4"
+eq "events unchanged after rejects" "$(jq -r 'length' <<<"$(get "/api/v1/sessions/$SID/events?after=0")")" "4"
 
 step "restart against the same DB — persistence + migrate() backfill"
 # Second boot re-runs migrate(), including the sessions-projection backfill.
@@ -348,8 +346,8 @@ step "restart against the same DB — persistence + migrate() backfill"
 stop_server
 start_server
 eq "GET /health .status (2nd boot)" "$(get /health | jq -r '.status')" "ok"
-eq "messages survive restart" "$(jq -r 'length' <<<"$(get "/api/v1/sessions/$SID/messages")")" "2"
-eq "assistant text survives"  "$(jq -r '.[1].content' <<<"$(get "/api/v1/sessions/$SID/messages")")" "$ASSISTANT_TEXT"
+eq "turns survive restart"   "$(jq -r '.model.turns | length' <<<"$(get "/api/v1/sessions/$SID/messages?limit=30")")" "1"
+eq "assistant text survives" "$(jq -r '[.model.entries[] | select(.kind=="result")][0].text' <<<"$(get "/api/v1/sessions/$SID/messages?limit=30")")" "$ASSISTANT_TEXT"
 ROW=$(jq -c --arg sid "$SID" '.[] | select(.session_id==$sid)' <<<"$(get /api/v1/sessions/aggregates)")
 eq "turns not double-counted by backfill" "$(jq -r '.turns' <<<"$ROW")" "1"
 eq "input_tokens not double-counted"      "$(jq -r '.input_tokens' <<<"$ROW")" "1234"
@@ -358,6 +356,6 @@ eq "harness-id lookup survives restart" \
 
 step "SUCCESS — log-store boots, ingests, materializes, and persists"
 echo "    routes exercised: POST /api/v1/events; GET /health,"
-echo "      /api/v1/sessions/{id}/{messages,history,events,turn-state},"
+echo "      /api/v1/sessions/{id}/{messages,events,turn-state},"
 echo "      /api/v1/sessions/search, /api/v1/sessions/aggregates,"
 echo "      /api/v1/sessions/by-harness-id"

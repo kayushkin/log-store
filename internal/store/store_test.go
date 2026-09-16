@@ -100,7 +100,7 @@ func TestStoreEventPersistsAndAssignsIDs(t *testing.T) {
 		t.Fatalf("expected ascending positive ids, got %d then %d", id1, id2)
 	}
 
-	events, err := s.ListEvents("sess-a", nil)
+	events, err := s.ListEventsSinceID("sess-a", 0, nil)
 	if err != nil {
 		t.Fatalf("ListEvents: %v", err)
 	}
@@ -137,7 +137,7 @@ func TestListEventsTypeFilterAndIsolation(t *testing.T) {
 	}
 
 	// Type filter: only user_message events of sess-a.
-	got, err := s.ListEvents("sess-a", []string{"user_message"})
+	got, err := s.ListEventsSinceID("sess-a", 0, []string{"user_message"})
 	if err != nil {
 		t.Fatalf("ListEvents filtered: %v", err)
 	}
@@ -146,7 +146,7 @@ func TestListEventsTypeFilterAndIsolation(t *testing.T) {
 	}
 
 	// Session isolation: sess-b must not leak into sess-a reads.
-	all, err := s.ListEvents("sess-a", nil)
+	all, err := s.ListEventsSinceID("sess-a", 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

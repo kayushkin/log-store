@@ -123,8 +123,8 @@ func TestRoutesDoNotCollide(t *testing.T) {
 	st.StoreEvent("br_held", "user_message", harnessBody(t, "cc-uuid-held"))
 
 	for _, path := range []string{
-		"/api/v1/sessions/br_held/messages",
-		"/api/v1/sessions/br_held/history",
+		"/api/v1/sessions/br_held/messages?limit=30",
+		"/api/v1/sessions/br_held/events?after=0",
 		"/api/v1/sessions/br_held/turn-state",
 		"/api/v1/sessions/search?q=hello",
 		"/api/v1/sessions/by-harness-id?harness_session_id=cc-uuid-held",
