@@ -37,6 +37,10 @@ func New(s *store.Store, forwarder *ls.Forwarder) *Server {
 	// literal in the fourth position overlaps /sessions/{id}/messages, and
 	// Go's ServeMux PANICS at registration on an ambiguous pair.
 	srv.mux.HandleFunc("GET /api/v1/sessions/by-harness-id", srv.handleSessionsByHarnessID)
+	// Deploy log — the record of every deploy.sh run, so a stale or
+	// wrong-branch deploy leaves a fingerprint the drift guard can read.
+	srv.mux.HandleFunc("POST /api/v1/deploys", srv.handleIngestDeploy)
+	srv.mux.HandleFunc("GET /api/v1/deploys", srv.handleListDeploys)
 	srv.mux.HandleFunc("GET /health", srv.handleHealth)
 	return srv
 }

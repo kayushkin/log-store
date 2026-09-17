@@ -125,6 +125,9 @@ func (s *Store) migrate() error {
 	if err := s.migrateHarnessSessionID(); err != nil {
 		return err
 	}
+	if err := s.migrateDeploys(); err != nil {
+		return err
+	}
 	// Backfill from events for any session not already projected. Runs once
 	// per session — guarded by NOT IN to skip already-populated sessions.
 	if _, err := s.writer.Exec(`
