@@ -22,7 +22,7 @@ func serverWithForwarder(t *testing.T, logstackURL string) (*Server, *ls.Forward
 	t.Cleanup(func() { s.Close() })
 
 	f := ls.NewForwarder(logstackURL)
-	return New(s, f), f
+	return New(s, f, newTestSettings(t, map[string]string{"LOG_STORE_LOGSTACK_URL": logstackURL})), f
 }
 
 func getHealth(t *testing.T, srv *Server) (int, map[string]any) {

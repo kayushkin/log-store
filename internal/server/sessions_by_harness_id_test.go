@@ -19,7 +19,7 @@ func newTestServer(t *testing.T) (*Server, *store.Store) {
 		t.Fatalf("store.New: %v", err)
 	}
 	t.Cleanup(func() { s.Close() })
-	return New(s, nil), s
+	return New(s, nil, newTestSettings(t, nil)), s
 }
 
 func harnessBody(t *testing.T, harnessSessionID string) []byte {

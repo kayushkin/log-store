@@ -58,6 +58,17 @@ if [ "$vcs_modified" = "true" ]; then
     echo "    source is not recoverable from any commit. Commit first for a reproducible build." >&2
 fi
 
+# A misspelled LOG_STORE_ variable stops the new binary at boot. Ask before the
+# old one is stopped: build the registry from the running service's own
+# environment. The test prints a verdict, never a value.
+echo "==> Checking the running service's environment against the declared settings..."
+live_pid="$(systemctl --user show -p MainPID --value "$SERVICE")"
+if [ -n "$live_pid" ] && [ "$live_pid" != "0" ]; then
+  go test -count=1 -run '^TestTheLiveProcessEnvironmentBuildsARegistry$' ./internal/config -args -live-environment-file="/proc/$live_pid/environ"
+else
+  echo "    $SERVICE is not running, so there is no environment to check"
+fi
+
 echo "==> Stopping $SERVICE..."
 systemctl --user stop "$SERVICE" 2>/dev/null || true
 sleep 1

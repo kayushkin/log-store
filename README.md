@@ -83,6 +83,7 @@ curl 'http://localhost:8175/api/v1/sessions/abc123/events?after=42'
 | `GET` | `/api/v1/sessions/aggregates` | Per-session token, turn and duration totals. No cost: a session's cost is llm-bridge-server's `spend_usd` / the `session_cost` event |
 | `GET` | `/api/v1/sessions/by-harness-id?harness_session_id=` | Sessions holding a harness session id |
 | `GET` | `/health` | `{"status": "ok"}` plus forwarder state |
+| `GET` | `/settings` | Every environment variable the service reads, with the value in force and its source; read-only |
 
 ### Stored turns
 
@@ -103,6 +104,14 @@ All configuration is via environment variables.
 | `LOG_STORE_LISTEN_ADDR` | `:8175` | HTTP listen address |
 | `LOG_STORE_DB_PATH` | `~/.config/log-store/events.db` | SQLite database path |
 | `LOG_STORE_LOGSTACK_URL` | `http://localhost:8081` | Logstack URL for forwarding result statistics |
+
+All three are declared once in `internal/config` with llm-bridge `servicesettings`, and
+`GET /settings` describes them with the value in force. A new variable is declared there or
+`TestEveryEnvironmentVariableTheServiceReadsIsDeclared` fails. A set variable that starts with
+`LOG_STORE_LISTEN`, `LOG_STORE_DB` or `LOG_STORE_LOGSTACK` and is not one of the three is a
+misspelling, and stops the service at startup; `deploy.sh` checks the running service's
+environment for one before it stops it. Declare nothing `Editable` and no secret: every route
+here is open.
 
 > ⚠️ **The default matches logstack's *code* default, not necessarily your deployment.**
 > logstack reads `LOGSTACK_PORT` and defaults it to `8081`; if your logstack unit

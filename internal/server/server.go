@@ -13,6 +13,7 @@ import (
 	ls "github.com/kayushkin/log-store/internal/logstack"
 	"github.com/kayushkin/log-store/internal/store"
 	"github.com/kayushkin/llm-bridge/msg"
+	"github.com/kayushkin/llm-bridge/servicesettings"
 )
 
 type Server struct {
@@ -22,7 +23,12 @@ type Server struct {
 	materializer *turnMaterializer
 }
 
-func New(s *store.Store, forwarder *ls.Forwarder) *Server {
+// New builds the server over s. settings is what GET /settings describes; a nil
+// one panics here, at boot, rather than at the first read of the route.
+func New(s *store.Store, forwarder *ls.Forwarder, settings *servicesettings.Registry) *Server {
+	if settings == nil {
+		panic("log-store: server.New needs the settings registry that GET /settings serves")
+	}
 	// The turn index records dual-emit candidates by the rule in dedup.go. Set before
 	// anything is served, so no event is indexed without it.
 	s.SetDedupCandidates(dedupCandidateOf, dedupCandidateVersion)
@@ -50,6 +56,9 @@ func New(s *store.Store, forwarder *ls.Forwarder) *Server {
 	// Go's ServeMux PANICS at registration on an ambiguous pair.
 	srv.mux.HandleFunc("GET /api/v1/sessions/by-harness-id", srv.handleSessionsByHarnessID)
 	srv.mux.HandleFunc("GET /health", srv.handleHealth)
+	// Read-only, and as open as every other route. PUT /settings/{key} is not
+	// mounted: no setting is Editable, so there is nothing a write could change.
+	srv.mux.Handle("GET /settings", servicesettings.Handler(settings, "/settings"))
 	return srv
 }
 

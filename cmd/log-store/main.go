@@ -4,6 +4,7 @@ import (
 	"log"
 	"net/http"
 
+	"github.com/kayushkin/llm-bridge/servicesettings"
 	"github.com/kayushkin/log-store/internal/config"
 	ls "github.com/kayushkin/log-store/internal/logstack"
 	"github.com/kayushkin/log-store/internal/server"
@@ -11,7 +12,14 @@ import (
 )
 
 func main() {
-	cfg := config.Load()
+	settings, err := config.NewSettingsRegistry(servicesettings.ProcessEnvironment())
+	if err != nil {
+		log.Fatalf("[log-store] read settings: %v", err)
+	}
+	if err := settings.CheckRequired(); err != nil {
+		log.Fatalf("[log-store] read settings: %v", err)
+	}
+	cfg := config.Load(settings)
 
 	s, err := store.New(cfg.DBPath)
 	if err != nil {
@@ -24,7 +32,7 @@ func main() {
 	// to be invisible until it had already dropped thousands of results, one
 	// identical 404 at a time.
 	forwarder.Preflight()
-	srv := server.New(s, forwarder)
+	srv := server.New(s, forwarder, settings)
 
 	// Index the turns of every session written before the turn index existed,
 	// newest first. Reads do not wait for it: a read that reaches an unindexed
