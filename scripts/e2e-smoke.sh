@@ -298,7 +298,10 @@ ROW=$(jq -c --arg sid "$SID" '.[] | select(.session_id==$sid)' <<<"$AGG")
 eq "aggregate turns"         "$(jq -r '.turns' <<<"$ROW")" "1"
 eq "aggregate input_tokens"  "$(jq -r '.input_tokens' <<<"$ROW")" "1234"
 eq "aggregate output_tokens" "$(jq -r '.output_tokens' <<<"$ROW")" "56"
-eq "aggregate cost_usd"      "$(jq -r '.cost_usd' <<<"$ROW")" "0.25"
+# The projection no longer sums cost (372c80a): Claude Code reports
+# total_usd cumulatively, so the sum counted each turn's spending again. A
+# session's cost is llm-bridge-server's estimate, and this row must not carry one.
+eq "aggregate has no cost_usd" "$(jq -r 'has("cost_usd")' <<<"$ROW")" "false"
 eq "aggregate duration_ms"   "$(jq -r '.duration_ms' <<<"$ROW")" "777"
 eq "aggregate model"         "$(jq -r '.model' <<<"$ROW")" "$MODEL"
 
