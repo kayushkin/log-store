@@ -157,7 +157,7 @@ type HeldSession struct {
 // transcripts into the production store: the check lived in a database the
 // store could not see.
 //
-// An empty id is refused here rather than sent, because ” is a real stored
+// An empty id is refused here rather than sent, because '' is a real stored
 // value (every session whose events name no harness id) and would match
 // thousands of unrelated rows.
 func (c *Client) SessionsHoldingHarnessSessionID(harnessSessionID string) ([]HeldSession, error) {
