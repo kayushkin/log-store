@@ -45,6 +45,8 @@ func New(s *store.Store, forwarder *ls.Forwarder, settings *servicesettings.Regi
 	// One entry of the reading page with its full tool payloads — what a preview
 	// page (payload=preview) points at for a shortened tool input or output.
 	srv.mux.HandleFunc("GET /api/v1/sessions/{id}/entries/{eventId}", srv.handleEntry)
+	// The bytes of one image a tool result carries; the page lists them by index.
+	srv.mux.HandleFunc("GET /api/v1/sessions/{id}/entries/{eventId}/images/{index}", srv.handleEntryImage)
 	// chat-page endpoints — turn-model materialization + validators.
 	srv.mux.HandleFunc("GET /api/v1/sessions/validators", srv.handleValidators)
 	srv.mux.HandleFunc("GET /api/v1/sessions/bundle", srv.handleBundle)

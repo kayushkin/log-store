@@ -126,9 +126,38 @@ type Entry struct {
 	ToolResultBytes     int  `json:"toolResultBytes,omitempty"`
 	ToolResultTruncated bool `json:"toolResultTruncated,omitempty"`
 
+	// ToolResultImages lists the images a tool result carries
+	// (ToolResultEvent.Content) by position and type, never their bytes: a
+	// screenshot is ~100 KB of base64, and a page that carried them would be
+	// the page `raw` was dropped from. The bytes are at
+	// GET /api/v1/sessions/{id}/entries/{eventId}/images/{index}.
+	ToolResultImages []ToolResultImage `json:"toolResultImages,omitempty"`
+
+	// SessionFile is the file an EventSessionFile shared into the session, as
+	// the canonical record: who shared it, its name, type, size and file id.
+	SessionFile *msg.SessionFile `json:"sessionFile,omitempty"`
+
 	Duplicate bool   `json:"duplicate"`
 	Primary   bool   `json:"primary"`
 	GroupID   string `json:"groupId,omitempty"`
+}
+
+// ToolResultImage is one image of a tool result: Index is its position in
+// ToolResultEvent.Content, which is how its bytes are asked for.
+type ToolResultImage struct {
+	Index     int    `json:"index"`
+	MediaType string `json:"mediaType"`
+}
+
+// toolResultImagesOf lists a tool result's images without their bytes.
+func toolResultImagesOf(result *msg.ToolResultEvent) []ToolResultImage {
+	var images []ToolResultImage
+	for index, block := range result.Content {
+		if block.Type == msg.BlockImage && block.Image != nil {
+			images = append(images, ToolResultImage{Index: index, MediaType: block.Image.Source.MediaType})
+		}
+	}
+	return images
 }
 
 // EntryUsage is the per-message token usage carried on an assistant/result
@@ -274,6 +303,13 @@ func classify(ev *msg.Event) (role, kind string, conversation bool) {
 		return "tool", "tool_result", true
 	case msg.EventError:
 		return "assistant", "error", true
+	case msg.EventSessionFile:
+		// A file shared into the session is conversation, said by whoever shared
+		// it: the user uploading, or the agent showing the user something.
+		if ev.SessionFile != nil && ev.SessionFile.SharedBy == msg.SessionFileSharedByAgent {
+			return "assistant", "file", true
+		}
+		return "user", "file", true
 	case msg.EventSystem:
 		// A system event's KIND is "system". Whether it belongs in the COLLAPSED
 		// Turns view is a different question, answered by `conversation` below —
@@ -466,7 +502,10 @@ func buildTurnModelWithAggregateSources(sessionID string, rows []store.EventRow,
 				e.ToolName = ev.ToolResult.Name
 				e.ToolID = ev.ToolResult.ToolID
 				e.ToolError = ev.ToolResult.IsError
+				e.ToolResultImages = toolResultImagesOf(ev.ToolResult)
 			}
+		case msg.EventSessionFile:
+			e.SessionFile = ev.SessionFile
 		}
 		e.ToolInput, e.ToolResult = toolPayloads(&ev)
 		// Kind-specific fields, mapped straight from the canonical event.
