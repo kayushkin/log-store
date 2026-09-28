@@ -55,6 +55,22 @@ func TestASharedFileIsConversationSaidByWhoeverSharedIt(t *testing.T) {
 	}
 }
 
+func TestASessionActionIsConversationOfferedByTheAgentAndRunAsARecord(t *testing.T) {
+	for state, wantRole := range map[msg.SessionActionState]string{
+		msg.SessionActionOffered:   "assistant",
+		msg.SessionActionRunning:   "system",
+		msg.SessionActionSucceeded: "system",
+	} {
+		action := &msg.SessionAction{ActionID: "session_action_000001", Command: "run deploy.sh", State: state,
+			Offer: msg.SessionActionOffer{Label: "Deploy dash", Type: msg.SessionActionDeploy, RepoID: 12}}
+		m := buildTurnModel("sess", []store.EventRow{mkRow(t, 1, msg.Event{Type: msg.EventSessionAction, Timestamp: time.Now(), SessionAction: action})}, false)
+		entry := entryOfEvent(t, m, 1)
+		if entry.Role != wantRole || entry.Kind != "action" || entry.Duplicate || entry.SessionAction == nil || entry.SessionAction.Offer.Label != "Deploy dash" {
+			t.Errorf("%s: entry = role %q kind %q duplicate %v action %+v", state, entry.Role, entry.Kind, entry.Duplicate, entry.SessionAction)
+		}
+	}
+}
+
 func entryOfEvent(t *testing.T, m TurnModel, eventID int64) Entry {
 	t.Helper()
 	for _, entry := range m.Entries {

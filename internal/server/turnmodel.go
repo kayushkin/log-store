@@ -137,6 +137,11 @@ type Entry struct {
 	// the canonical record: who shared it, its name, type, size and file id.
 	SessionFile *msg.SessionFile `json:"sessionFile,omitempty"`
 
+	// SessionAction is the session action an EventSessionAction recorded, as
+	// the canonical record. The entry whose record is offered is where the
+	// button was put; each later one is a step of its one run.
+	SessionAction *msg.SessionAction `json:"sessionAction,omitempty"`
+
 	Duplicate bool   `json:"duplicate"`
 	Primary   bool   `json:"primary"`
 	GroupID   string `json:"groupId,omitempty"`
@@ -310,6 +315,13 @@ func classify(ev *msg.Event) (role, kind string, conversation bool) {
 			return "assistant", "file", true
 		}
 		return "user", "file", true
+	case msg.EventSessionAction:
+		// The agent offers a button; each later step of its run is a record of
+		// what happened. chat-core's live reducer says the same.
+		if ev.SessionAction != nil && ev.SessionAction.State == msg.SessionActionOffered {
+			return "assistant", "action", true
+		}
+		return "system", "action", true
 	case msg.EventSystem:
 		// A system event's KIND is "system". Whether it belongs in the COLLAPSED
 		// Turns view is a different question, answered by `conversation` below —
@@ -506,6 +518,8 @@ func buildTurnModelWithAggregateSources(sessionID string, rows []store.EventRow,
 			}
 		case msg.EventSessionFile:
 			e.SessionFile = ev.SessionFile
+		case msg.EventSessionAction:
+			e.SessionAction = ev.SessionAction
 		}
 		e.ToolInput, e.ToolResult = toolPayloads(&ev)
 		// Kind-specific fields, mapped straight from the canonical event.

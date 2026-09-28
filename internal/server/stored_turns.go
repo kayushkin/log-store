@@ -32,7 +32,7 @@ import (
 // ⚠️ BUMP IT whenever turnmodel.go, project.go, dedup.go or this file changes what a built
 // turn contains. TestMaterializerVersionTracksTheRules fails until you do: it
 // fingerprints those files and compares against materializerRulesFingerprint.
-const materializerVersion = 3
+const materializerVersion = 4
 
 // toolPayloadPreviewBytes is the most of any one tool string a preview page carries.
 const toolPayloadPreviewBytes = 2048
