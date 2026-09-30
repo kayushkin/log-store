@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -65,9 +66,24 @@ func TestASessionActionIsConversationOfferedByTheAgentAndRunAsARecord(t *testing
 			Offer: msg.SessionActionOffer{Label: "Deploy dash", Type: msg.SessionActionDeploy, RepoID: 12}}
 		m := buildTurnModel("sess", []store.EventRow{mkRow(t, 1, msg.Event{Type: msg.EventSessionAction, Timestamp: time.Now(), SessionAction: action})}, false)
 		entry := entryOfEvent(t, m, 1)
-		if entry.Role != wantRole || entry.Kind != "action" || entry.Duplicate || entry.SessionAction == nil || entry.SessionAction.Offer.Label != "Deploy dash" {
-			t.Errorf("%s: entry = role %q kind %q duplicate %v action %+v", state, entry.Role, entry.Kind, entry.Duplicate, entry.SessionAction)
+		var projected msg.SessionAction
+		json.Unmarshal(entry.SessionAction, &projected)
+		if entry.Role != wantRole || entry.Kind != "action" || entry.Duplicate || projected.Offer.Label != "Deploy dash" {
+			t.Errorf("%s: entry = role %q kind %q duplicate %v action %s", state, entry.Role, entry.Kind, entry.Duplicate, entry.SessionAction)
 		}
+	}
+}
+
+func TestASessionActionReachesThePageWithFieldsThisBinaryDoesNotKnow(t *testing.T) {
+	raw := []byte(`{"type":"session_action","timestamp":"2026-09-30T00:00:00Z","session_action":{"action_id":"session_action_000028","state":"succeeded","offer":{"label":"List","type":"run_command","result_format":"markdown"},"a_field_added_later":{"kept":true}}}`)
+	m := buildTurnModel("sess", []store.EventRow{{ID: 1, Data: raw}}, false)
+	entry := entryOfEvent(t, m, 1)
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(entry.SessionAction, &fields); err != nil {
+		t.Fatalf("sessionAction = %s: %v", entry.SessionAction, err)
+	}
+	if string(fields["a_field_added_later"]) != `{"kept":true}` || !strings.Contains(string(fields["offer"]), `"result_format":"markdown"`) {
+		t.Errorf("sessionAction = %s", entry.SessionAction)
 	}
 }
 

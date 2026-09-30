@@ -137,10 +137,14 @@ type Entry struct {
 	// the canonical record: who shared it, its name, type, size and file id.
 	SessionFile *msg.SessionFile `json:"sessionFile,omitempty"`
 
-	// SessionAction is the session action an EventSessionAction recorded, as
-	// the canonical record. The entry whose record is offered is where the
-	// button was put; each later one is a step of its one run.
-	SessionAction *msg.SessionAction `json:"sessionAction,omitempty"`
+	// SessionAction is the session action an EventSessionAction recorded,
+	// exactly as the event carried it. The entry whose record is offered is
+	// where the button was put; each later one is a step of its one run. Kept
+	// as the event's own bytes, not decoded into msg.SessionAction and encoded
+	// again: until 2026-09-30 it was, and every field added to the record
+	// after this binary was built — result_format, review, cost_usd — vanished
+	// from the page, so a command that asked for markdown drew as plain text.
+	SessionAction json.RawMessage `json:"sessionAction,omitempty"`
 
 	Duplicate bool   `json:"duplicate"`
 	Primary   bool   `json:"primary"`
@@ -519,7 +523,7 @@ func buildTurnModelWithAggregateSources(sessionID string, rows []store.EventRow,
 		case msg.EventSessionFile:
 			e.SessionFile = ev.SessionFile
 		case msg.EventSessionAction:
-			e.SessionAction = ev.SessionAction
+			e.SessionAction = sessionActionBytesOf(r.Data)
 		}
 		e.ToolInput, e.ToolResult = toolPayloads(&ev)
 		// Kind-specific fields, mapped straight from the canonical event.
@@ -1018,4 +1022,16 @@ func quoteJSON(s string) []byte {
 		return []byte(`""`)
 	}
 	return b
+}
+
+// sessionActionBytesOf is an event's session_action exactly as stored, or nil
+// when it has none.
+func sessionActionBytesOf(event []byte) json.RawMessage {
+	var fields struct {
+		SessionAction json.RawMessage `json:"session_action"`
+	}
+	if err := json.Unmarshal(event, &fields); err != nil || len(fields.SessionAction) == 0 || string(fields.SessionAction) == "null" {
+		return nil
+	}
+	return fields.SessionAction
 }
