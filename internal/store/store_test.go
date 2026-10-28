@@ -801,3 +801,53 @@ func TestMigrationDropsTheSessionsCostColumn(t *testing.T) {
 		t.Fatalf("aggregates after the drop: %+v %v", aggs, err)
 	}
 }
+
+// A Codex session imported from disk stores the AGENTS.md instructions Codex
+// loaded as a user_message event. A search must find what the person and the
+// agent said, never a word that only those instructions contain.
+func TestSearchSessionsSkipsUserMessagesCodexInjected(t *testing.T) {
+	s := newTestStore(t)
+	injected := `{"type":"user_message","harness":"codex","result":{"text":"# AGENTS.md instructions\n\n<INSTRUCTIONS>\nask about acmewidgets first\n</INSTRUCTIONS>"}}`
+	environment := `{"type":"user_message","harness":"codex","result":{"text":"  <environment_context>\n<cwd>/work/acmewidgets</cwd>\n</environment_context>"}}`
+	typed := `{"type":"user_message","harness":"codex","result":{"text":"which acmewidgets orders are open?"}}`
+	reply := `{"type":"assistant","harness":"codex","result":{"text":"Looking at acmewidgets now."}}`
+	if _, err := s.StoreEvent("only-injected", "user_message", []byte(injected)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.StoreEvent("only-injected", "user_message", []byte(environment)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.StoreEvent("real", "user_message", []byte(injected)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.StoreEvent("real", "user_message", []byte(typed)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.StoreEvent("real", "assistant", []byte(reply)); err != nil {
+		t.Fatal(err)
+	}
+	// An agent's reply that quotes the marker is not injected: only a user
+	// message that begins with one is.
+	quoted := `{"type":"assistant","harness":"codex","result":{"text":"# AGENTS.md instructions mention acmewidgets"}}`
+	if _, err := s.StoreEvent("quoted", "assistant", []byte(quoted)); err != nil {
+		t.Fatal(err)
+	}
+
+	hits, err := s.SearchSessions("acmewidgets", 10)
+	if err != nil {
+		t.Fatalf("SearchSessions: %v", err)
+	}
+	got := map[string]int{}
+	for _, hit := range hits {
+		got[hit.SessionID] = hit.MatchCount
+	}
+	if _, found := got["only-injected"]; found {
+		t.Errorf("a session whose only matches are injected user messages was found: %v", got)
+	}
+	if got["real"] != 2 {
+		t.Errorf("real session matches = %d, want 2 (the typed message and the reply, not the instructions): %v", got["real"], got)
+	}
+	if got["quoted"] != 1 {
+		t.Errorf("an assistant message quoting the marker must still match: %v", got)
+	}
+}

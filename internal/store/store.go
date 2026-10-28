@@ -1,14 +1,16 @@
 package store
 
 import (
-	"time"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
+	"time"
 
+	"github.com/kayushkin/llm-bridge/msg"
 	_ "modernc.org/sqlite"
 )
 
@@ -548,6 +550,9 @@ func (s *Store) SearchSessionsInWindow(query string, limit int, since, until tim
 		// No event at or after `until` means the window's right edge is past
 		// the end of the table — unbounded on that side, correctly.
 	}
+	injectedCondition, injectedArgs := injectedUserMessageExclusion()
+	idConditions += injectedCondition
+	args = append(args, injectedArgs...)
 	args = append(args, limit)
 	// The join sits outside the LIMIT, not inside it. Joining in the same
 	// SELECT as the GROUP BY makes SQLite look up the projection once per
@@ -586,6 +591,33 @@ func (s *Store) SearchSessionsInWindow(query string, limit int, since, until tim
 		hits = append(hits, h)
 	}
 	return hits, rows.Err()
+}
+
+// injectedUserMessageExclusion leaves out of a search the user messages that
+// are not what a person wrote: Codex writes the environment, the AGENTS.md
+// instructions it loaded and similar markers into a conversation as user
+// messages, and an imported Codex session stores each as a user_message
+// event. A raw match on those would find nearly every Codex session for any
+// word the instructions happen to contain. The list of how such a message
+// begins is llm-bridge's (msg.CodexInjectedTextPrefixes), the same one the
+// harness wrapper and the server use, so the three agree on what counts.
+//
+// The condition is appended after the LIKE, so SQLite reads the event's JSON
+// only for rows whose raw text already matched.
+func injectedUserMessageExclusion() (string, []any) {
+	prefixes := msg.CodexInjectedTextPrefixes()
+	if len(prefixes) == 0 {
+		return "", nil
+	}
+	tests := make([]string, len(prefixes))
+	args := make([]any, 0, 2*len(prefixes))
+	for i, prefix := range prefixes {
+		tests[i] = "substr(injected_text, 1, length(?)) = ?"
+		args = append(args, prefix, prefix)
+	}
+	condition := " AND NOT (type = 'user_message' AND EXISTS (SELECT 1 FROM (SELECT ltrim(COALESCE(json_extract(data, '$.result.text'), ''), ' ' || char(9, 10, 13)) AS injected_text) WHERE " +
+		strings.Join(tests, " OR ") + "))"
+	return condition, args
 }
 
 // firstEventIDAtOrAfter finds the smallest event id whose created_at is at or
